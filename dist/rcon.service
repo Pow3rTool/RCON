@@ -1,0 +1,56 @@
+[Unit]
+Description=Pow3rtool RCON agent (reverse-dials XConnect, serves the admin tool surface)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Enroll once if no valid cert yet (blocks until an operator approves), then serve.
+# Config via EnvironmentFile=/etc/rcon/enroll.env (0600), e.g.:
+#   RCON_JOIN_TOKEN=pjt_...
+#   RCON_XCONNECT_URL=https://<xconnect-fqdn>     # nginx /bootstrap base URL (real TLS)
+#   RCON_BROKER=<xconnect-fqdn>:3                 # reverse-dial broker host:port
+#   RCON_CA_PIN=sha256:<hex>                      # out-of-band CA pin (recommended)
+# Bootstrap TLS is VERIFIED by default. Only add --insecure for a genuinely
+# self-signed origin, and only together with --ca-pin (else enrollment is MITM-able).
+EnvironmentFile=-/etc/rcon/enroll.env
+# Token + CA pin are read from the environment (RCON_JOIN_TOKEN / RCON_CA_PIN),
+# NOT passed as args — so the fleet credential never appears in `ps` / journald /
+# `systemctl show`. Only non-secret flags go on the command line.
+ExecStartPre=/usr/local/bin/rcon enroll --if-needed \
+    --xconnect ${RCON_XCONNECT_URL} --etc /etc/rcon
+ExecStart=/usr/local/bin/rcon --etc /etc/rcon --broker ${RCON_BROKER}
+Restart=always
+RestartSec=5
+# enroll --if-needed may wait for operator approval on first boot.
+TimeoutStartSec=infinity
+# RCON is, BY DESIGN, a privileged admin agent: /run and /jobs execute operator
+# commands as root and /edit/write touch arbitrary paths — it gives a trusted
+# operator's agent the same reach that operator already has by SSH-ing to the box.
+# So process sandboxing that fights that purpose is deliberately OFF
+# (NoNewPrivileges / ProtectSystem / cap-drop): it is only false containment (a
+# command it runs could undo it) against someone who already holds root. The real
+# blast-radius controls live UPSTREAM — per-principal+verb authZ at XConnect/
+# Orthanc, the readonly/full grant split, the (advisory) step-up flag the trusted
+# caller honors, and end-to-end audit.
+#
+# We DID evaluate the "non-undoable" systemd directives a cold-eye review suggested
+# as "free" hardening. Most are rejected because they break legitimate remote
+# administration — which is the entire job of this agent:
+#   ProtectKernelLogs    -> breaks `dmesg` (core troubleshooting)
+#   ProtectKernelTunables-> breaks `sysctl -w` / writing /proc/sys, /sys
+#   ProtectKernelModules -> breaks `modprobe` / loading a driver
+#   ProtectControlGroups -> breaks cgroup / container management
+#   RestrictNamespaces   -> breaks containers, `ip netns`, `unshare`
+#   ProtectClock         -> breaks fixing a drifted clock (also cert-validity relevant)
+#   LockPersonality      -> can perturb ASLR-disable when launching a program under gdb
+# Reading process memory, attaching a debugger (ptrace), and packet capture
+# (AF_PACKET / CAP_NET_RAW) must all keep working, so NO SystemCallFilter or
+# CapabilityBoundingSet drop either. RestrictRealtime is the one directive that
+# costs a sysadmin nothing here, so we take it.
+NoNewPrivileges=false
+ProtectSystem=false
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+hosts.json
+*.bak
+*.bak.*
+__pycache__/
+*.pyc
+venv/
+.env
+*.pem
+*.key
+id_*
+
+# go build + identity
+/rcon
+/RCON
+
+etc/
+*.pem
+*.key
+
+# build artifacts + stray binaries (never commit binaries to the public repo).
+# Keep dist/ docs (DEPLOY.md, rcon.service) — only the compiled binaries are ignored.
+dist/rcon-*
+/xconnect
