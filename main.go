@@ -176,7 +176,7 @@ func dialAndServe(addr string, cfg *tls.Config, h http.Handler) error {
 		return err
 	}
 	log.Printf("rcon: tunnel up to %s — serving tool surface back down it", addr)
-	setCurConn(conn)      // renew/apply closes this to force a cert-reloading reconnect
+	setCurConn(conn) // renew/apply closes this to force a cert-reloading reconnect
 	defer clearCurConn()
 	// We dialed as TLS client, but become the HTTP/2 SERVER on this conn.
 	// PINGs detect a silently-stalled tunnel (spanning-tree blip) within ~30s so
@@ -205,6 +205,10 @@ func mux(svid string, store *JobStore, etc, broker string) http.Handler {
 	m.HandleFunc("POST /read", readFile)
 	m.HandleFunc("POST /edit", editFile)
 	m.HandleFunc("POST /write", writeFile)
+	// Metadata writes use a distinct additive endpoint so a newer XConnect
+	// routed to an older RCON fails closed with 404 instead of having the old
+	// JSON decoder silently ignore owner/group/mode and report a false success.
+	m.HandleFunc("POST /write-metadata", writeFile)
 
 	// Cert renewal (XConnect-driven, over the tunnel): CSR out, signed cert in.
 	m.HandleFunc("GET /renew/csr", renewCSR(etc))

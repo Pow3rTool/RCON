@@ -17,6 +17,10 @@ reattachable). `read`/`edit`/`write` return `501` — spec is `reference/`.
 
 ## Safety contracts
 - **read-before-edit hash guard** — edit/write require the hash from a prior read; rejected if the file changed since (optimistic concurrency, safe across concurrent agents/humans)
+- **explicit write metadata** — `write` optionally accepts `owner` (local name or UID),
+  `group` (local name or GID), and an octal permission `mode`; all are resolved before
+  content changes, special mode bits are refused, and the response reports the
+  resulting numeric ownership and mode
 - **output caps at every layer** — a 100MB log can't tank the caller
 - **orphan-process reap** — each call runs in its own process group, swept after completion (`sleep 1000 &` can't outlive the RPC)
 - **token scrubbed from child env** — a `run` can't echo the device token back out

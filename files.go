@@ -13,8 +13,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 )
 
 const (
@@ -30,17 +33,19 @@ func shaBytes(data []byte) string {
 }
 
 // editFile: POST /edit {path, old_string, new_string, replace_all?, expected_hash?}
-//   -> {ok, replacements, hash}   409 stale (hash drift) | 409 ambiguous | 422 not-found
+//
+//	-> {ok, replacements, hash}   409 stale (hash drift) | 409 ambiguous | 422 not-found
+//
 // The read-before-write hash guard: if expected_hash is given and the file has
 // changed since, refuse (409 stale) so concurrent edits can't silently clobber.
 func editFile(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Path       string `json:"path"`
+		Path       string  `json:"path"`
 		OldString  *string `json:"old_string"`
 		NewString  *string `json:"new_string"`
-		ReplaceAll bool   `json:"replace_all"`
-		Expected   string `json:"expected_hash"`
-		Rid        string `json:"rid"` // XConnect correlation id (cross-ref to Witchhunt)
+		ReplaceAll bool    `json:"replace_all"`
+		Expected   string  `json:"expected_hash"`
+		Rid        string  `json:"rid"` // XConnect correlation id (cross-ref to Witchhunt)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, 400, map[string]any{"error": "invalid JSON body: " + err.Error()})
@@ -110,8 +115,80 @@ func editFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "path": body.Path, "replacements": reps, "hash": shaBytes(out)})
 }
 
-// writeFile: POST /write {path, content, expected_hash?, force?, make_dirs?}
-//   -> {ok, created, bytes, hash}   409 stale | 409 exists (no proof)
+// parseWriteMode accepts the familiar file-mode spellings used by operators:
+// "640", "0640", or "0o640". Only the nine permission bits are accepted;
+// setuid/setgid/sticky bits are deliberately out of scope for this primitive.
+func parseWriteMode(raw string) (os.FileMode, bool, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, false, nil
+	}
+	if strings.HasPrefix(s, "0o") {
+		s = strings.TrimPrefix(s, "0o")
+	}
+	if len(s) == 4 && s[0] == '0' {
+		s = s[1:]
+	}
+	if len(s) != 3 {
+		return 0, false, fmt.Errorf("mode must be three octal permission digits (for example 0640)")
+	}
+	for _, c := range s {
+		if c < '0' || c > '7' {
+			return 0, false, fmt.Errorf("mode must be octal (for example 0640)")
+		}
+	}
+	n, err := strconv.ParseUint(s, 8, 9)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid mode: %w", err)
+	}
+	return os.FileMode(n), true, nil
+}
+
+// parseLinuxID bounds IDs to the signed 32-bit range accepted consistently by
+// the Linux targets RCON supports. -1 is reserved by chown(2) as "unchanged".
+func parseLinuxID(raw, kind string) (int, error) {
+	n, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil || n < 0 {
+		return -1, fmt.Errorf("invalid %s id %q", kind, raw)
+	}
+	return int(n), nil
+}
+
+func resolveOwner(raw string) (int, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return -1, nil
+	}
+	if _, err := strconv.ParseUint(s, 10, 64); err == nil {
+		return parseLinuxID(s, "owner")
+	}
+	u, err := user.Lookup(s)
+	if err != nil {
+		return -1, fmt.Errorf("unknown owner %q", s)
+	}
+	return parseLinuxID(u.Uid, "owner")
+}
+
+func resolveGroup(raw string) (int, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return -1, nil
+	}
+	if _, err := strconv.ParseUint(s, 10, 64); err == nil {
+		return parseLinuxID(s, "group")
+	}
+	g, err := user.LookupGroup(s)
+	if err != nil {
+		return -1, fmt.Errorf("unknown group %q", s)
+	}
+	return parseLinuxID(g.Gid, "group")
+}
+
+// writeFile: POST /write
+// {path, content, expected_hash?, force?, make_dirs?, owner?, group?, mode?}
+//
+//	-> {ok, created, bytes, hash, mode, uid?, gid?}
+//	409 stale | 409 exists (no proof)
 func writeFile(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Path     string  `json:"path"`
@@ -119,6 +196,9 @@ func writeFile(w http.ResponseWriter, r *http.Request) {
 		Expected string  `json:"expected_hash"`
 		Force    bool    `json:"force"`
 		MakeDirs bool    `json:"make_dirs"`
+		Owner    string  `json:"owner"`
+		Group    string  `json:"group"`
+		Mode     string  `json:"mode"`
 		Rid      string  `json:"rid"` // XConnect correlation id (cross-ref to Witchhunt)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -127,6 +207,21 @@ func writeFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Path == "" || body.Content == nil {
 		writeJSON(w, 400, map[string]any{"error": "path and content required"})
+		return
+	}
+	mode, modeSet, err := parseWriteMode(body.Mode)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"error": err.Error()})
+		return
+	}
+	uid, err := resolveOwner(body.Owner)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"error": err.Error()})
+		return
+	}
+	gid, err := resolveGroup(body.Group)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"error": err.Error()})
 		return
 	}
 	exists := false
@@ -147,7 +242,10 @@ func writeFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.MakeDirs {
 		if dir := filepath.Dir(body.Path); dir != "" {
-			_ = os.MkdirAll(dir, 0o755)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				writeJSON(w, 500, map[string]any{"error": "create parent directories: " + err.Error()})
+				return
+			}
 		}
 	}
 	out := []byte(*body.Content)
@@ -155,9 +253,40 @@ func writeFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
 	}
+	// Apply ownership before an explicit mode: chown can clear set-id bits on
+	// Linux, and this ordering guarantees the requested final permission bits.
+	if uid != -1 || gid != -1 {
+		if err := os.Chown(body.Path, uid, gid); err != nil {
+			auditRecord("write", body.Path, 1, 0, body.Rid)
+			writeJSON(w, 500, map[string]any{"error": "apply ownership: " + err.Error(),
+				"content_written": true})
+			return
+		}
+	}
+	if modeSet {
+		if err := os.Chmod(body.Path, mode); err != nil {
+			auditRecord("write", body.Path, 1, 0, body.Rid)
+			writeJSON(w, 500, map[string]any{"error": "apply mode: " + err.Error(),
+				"content_written": true})
+			return
+		}
+	}
+	info, err := os.Stat(body.Path)
+	if err != nil {
+		auditRecord("write", body.Path, 1, 0, body.Rid)
+		writeJSON(w, 500, map[string]any{"error": "stat written file: " + err.Error(),
+			"content_written": true})
+		return
+	}
+	response := map[string]any{"ok": true, "path": body.Path,
+		"created": !exists, "bytes": len(out), "hash": shaBytes(out),
+		"mode": fmt.Sprintf("%04o", info.Mode().Perm())}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		response["uid"] = st.Uid
+		response["gid"] = st.Gid
+	}
 	auditRecord("write", body.Path, 0, 0, body.Rid)
-	writeJSON(w, 200, map[string]any{"ok": true, "path": body.Path,
-		"created": !exists, "bytes": len(out), "hash": shaBytes(out)})
+	writeJSON(w, 200, response)
 }
 
 // probeNUL reports whether the first 8 KB contain a NUL byte (binary heuristic).
@@ -185,7 +314,9 @@ func hashFile(path string) (string, int, error) {
 }
 
 // readFile: POST /read {path, offset?, limit?}
-//   -> {content(numbered), hash, total_lines, start_line, end_line, bytes, truncated}
+//
+//	-> {content(numbered), hash, total_lines, start_line, end_line, bytes, truncated}
+//
 // `hash` is over the WHOLE file (not the returned window) so it's a stable
 // concurrency token regardless of how much you paged.
 func readFile(w http.ResponseWriter, r *http.Request) {
