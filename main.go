@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,21 +31,28 @@ import (
 const outputCap = 1 << 20 // 1 MB, matches the reference daemon
 
 func main() {
+	if platformCommand(os.Args[1:]) {
+		return
+	}
+	runAgent(os.Args[1:])
+}
+
+func runAgent(args []string) {
 	// Subcommands: `rcon enroll …` self-registers a fresh box (interactive);
 	// `rcon install …` configures + enables the systemd service NON-blockingly
 	// (the fleet path); default (no subcommand) connects/serves.
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
+	if len(args) > 0 {
+		switch args[0] {
 		case "enroll":
-			runEnroll(os.Args[2:])
+			runEnroll(args[1:])
 			return
 		case "install":
-			runInstall(os.Args[2:])
+			runInstall(args[1:])
 			return
 		}
 	}
 
-	etc := flag.String("etc", "/nfs/pow3rtool/RCON/etc", "identity dir (device-cert/key, trust-bundle)")
+	etc := flag.String("etc", defaultIdentityDir(), "identity dir (device certificate/key reference, trust-bundle)")
 	broker := flag.String("broker", "127.0.0.1:3", "XConnect broker address to reverse-dial")
 	selftest := flag.Bool("selftest", false, "load identity + reach the broker, then exit (self-update gate)")
 	showVer := flag.Bool("version", false, "print version and exit")
@@ -55,11 +63,11 @@ func main() {
 	enrollIfNeeded := flag.Bool("enroll-if-needed", false, "serve: self-enroll (register + wait for approval) in-process if no valid cert, then serve")
 	joinToken := flag.String("token", os.Getenv("RCON_JOIN_TOKEN"), "serve: join token for --enroll-if-needed; defaults to $RCON_JOIN_TOKEN so it stays off the command line")
 	xconnectURL := flag.String("xconnect", "", "serve: XConnect bootstrap base URL for --enroll-if-needed")
-	insecure := flag.Bool("insecure", false, "serve: skip TLS verify during --enroll-if-needed (ONLY for a self-signed origin; pair with --ca-pin)")
+	insecure := flag.Bool("insecure", false, "unsupported for enrollment: install the bootstrap CA in the OS trust store")
 	caPin := flag.String("ca-pin", os.Getenv("RCON_CA_PIN"), "serve: out-of-band CA pin (sha256:<hex>); defaults to $RCON_CA_PIN")
 	enrollName := flag.String("name", "", "serve: requested node name for --enroll-if-needed (default hostname)")
-	auditLog := flag.String("audit-log", "/var/lib/rcon/audit.log", "serve: local tamper-evident (hash-chained) action audit log")
-	flag.Parse()
+	auditLog := flag.String("audit-log", defaultAuditPath(), "serve: local tamper-evident (hash-chained) action audit log")
+	flag.CommandLine.Parse(args)
 
 	if *showVer {
 		fmt.Println(version)
@@ -122,8 +130,7 @@ func main() {
 // (pins OUR CA, requires the broker to be a system/xconnect of OUR tenant —
 // system trust store ignored) plus our SVID. Shared by serve and --selftest.
 func buildTLS(etc string) (*tls.Config, string, error) {
-	cert, err := tls.LoadX509KeyPair(
-		filepath.Join(etc, "device-cert.pem"), filepath.Join(etc, "device-key.pem"))
+	cert, err := loadDeviceCertificate(etc)
 	if err != nil {
 		return nil, "", fmt.Errorf("load device keypair: %w", err)
 	}
@@ -171,7 +178,7 @@ func buildTLS(etc string) (*tls.Config, string, error) {
 }
 
 func dialAndServe(addr string, cfg *tls.Config, h http.Handler) error {
-	conn, err := tls.Dial("tcp", addr, cfg)
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 15 * time.Second}, "tcp", addr, cfg)
 	if err != nil {
 		return err
 	}
@@ -194,7 +201,9 @@ func mux(svid string, store *JobStore, etc, broker string) http.Handler {
 		writeJSON(w, 200, map[string]any{
 			"ok": true, "node": svid, "version": version, "protocol": protocolVersion,
 			"goos": runtime.GOOS, "goarch": runtime.GOARCH,
-			"time": time.Now().UTC().Format(time.RFC3339)})
+			"shell": commandShell, "os_version": platformOSVersion(),
+			"capabilities": map[string]bool{"self_update": supportsSelfUpdate, "posix_metadata": supportsPOSIXMetadata},
+			"time":         time.Now().UTC().Format(time.RFC3339)})
 	})
 
 	// Self-update: XConnect relays an Orthanc-SIGNED binary down the tunnel.

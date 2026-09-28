@@ -1,13 +1,12 @@
 package main
 
 import (
-	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -32,17 +31,17 @@ func maxConcurrentJobs() int { return envInt("RCON_MAX_JOBS", 64) }
 // monotonic cursor (so a client can reattach after a blip and resume with no
 // loss/dupes), and survives tunnel drops — only an explicit cancel kills it.
 type Job struct {
-	ID       string
-	Cmd      string
-	RID      string // XConnect correlation id (cross-ref to the central Witchhunt)
-	mu       sync.Mutex
-	buf      []byte // output, capped; cursor = index into this
+	ID        string
+	Cmd       string
+	RID       string // XConnect correlation id (cross-ref to the central Witchhunt)
+	mu        sync.Mutex
+	buf       []byte // output, capped; cursor = index into this
 	truncated bool
-	state    string // "running" | "exited"
-	exit     int
-	pgid     int
-	started  time.Time
-	ended    time.Time
+	state     string // "running" | "exited"
+	exit      int
+	tree      processTree
+	started   time.Time
+	ended     time.Time
 }
 
 const jobBufCap = 4 << 20 // 4 MB buffered per job before truncation
@@ -102,15 +101,14 @@ func (j *Job) finish(state string, exit int) {
 }
 
 func (j *Job) Cancel() {
-	if j.pgid > 0 {
-		// Kill the whole process group: SIGTERM, then SIGKILL shortly after.
-		syscall.Kill(-j.pgid, syscall.SIGTERM)
-		go func(pgid int) {
-			time.Sleep(3 * time.Second)
-			syscall.Kill(-pgid, syscall.SIGKILL)
-		}(j.pgid)
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.state == "running" && j.tree != nil {
+		_ = j.tree.Cancel()
 	}
 }
+
+func (j *Job) Write(p []byte) (int, error) { j.append(p); return len(p), nil }
 
 type JobStore struct {
 	mu   sync.Mutex
@@ -156,32 +154,33 @@ func (s *JobStore) Start(cmdStr, rid string) (*Job, error) {
 	s.jobs[id] = j
 	s.mu.Unlock()
 
-	cmd := exec.Command("/bin/bash", "-lc", cmdStr)
-	cmd.Env = childEnv()                                  // scrub the join token from the child (see run.go)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // own process group
-	stdout, _ := cmd.StdoutPipe()
-	cmd.Stderr = cmd.Stdout // merge; bounded by the buffer cap
-	if err := cmd.Start(); err != nil {
+	cmd, tree, err := newShellCommand(context.Background(), cmdStr, defaultCwd(), "", true)
+	if err == nil {
+		cmd.Stdout, cmd.Stderr = j, j
+		err = cmd.Start()
+		if err == nil {
+			err = tree.Started(cmd)
+			if err != nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			}
+		}
+	}
+	if err != nil {
+		if tree != nil {
+			tree.Close()
+		}
 		j.append([]byte("failed to start: " + err.Error() + "\n"))
 		j.finish("exited", 127)
 		auditRecord("job", cmdStr, 127, 0, rid) // start failed — single record
 		return j, nil
 	}
-	j.pgid = cmd.Process.Pid          // group leader == child pid
+	j.mu.Lock()
+	j.tree = tree
+	j.mu.Unlock()
 	auditRecord("job", cmdStr, -1, 0, rid) // node-side record (rc/dur unknown at start)
 
 	go func() {
-		r := bufio.NewReader(stdout)
-		b := make([]byte, 32<<10)
-		for {
-			n, err := r.Read(b)
-			if n > 0 {
-				j.append(b[:n])
-			}
-			if err != nil {
-				break
-			}
-		}
 		exit := 0
 		if err := cmd.Wait(); err != nil {
 			if ee, ok := err.(*exec.ExitError); ok {
@@ -190,6 +189,7 @@ func (s *JobStore) Start(cmdStr, rid string) (*Job, error) {
 				exit = -1
 			}
 		}
+		tree.Close()
 		j.finish("exited", exit)
 		// Completion record carries the real rc + node-side duration.
 		auditRecord("job", cmdStr, exit, j.Dur(), rid)

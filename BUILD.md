@@ -1,24 +1,32 @@
-# Building & releasing the RCON agent
+# Building the RCON agent
+
+The public repository distributes source code, not executable downloads or ZIP
+packages. Build and sign artifacts inside your own deployment environment. The
+release/promotion commands below describe an operator's internal fleet workflow.
+For Windows, use your organization's enterprise code-signing policy; this project
+does not require a public signing service or a new certificate authority.
 
 How to compile the agent and cut a release that nodes will accept as a signed
 self-update. **Build on a build host** (anything with the Go toolchain + the
-`/nfs/pow3rtool` source) — *not* on the control- or data-plane VMs; those run
+RCON source) — *not* on the control- or data-plane VMs; those run
 prebuilt binaries by design (smaller attack surface).
 
 ## Prerequisites
 - **Go 1.26+** (matches `go.mod`). Install from go.dev; e.g.
-  `curl -LO https://go.dev/dl/go1.26.4.linux-amd64.tar.gz && sudo tar -C /usr/local -xzf go*.tar.gz`
+  `curl -LO https://go.dev/dl/go1.26.8.linux-amd64.tar.gz && sudo tar -C /usr/local -xzf go*.tar.gz`
   → `go` at `/usr/local/go/bin/go`.
-- The `/nfs/pow3rtool` source mounted (or a clone).
-- `release-pubkey.txt` present in `RCON/` (the Ed25519 **release public key**).
-  It's already pinned. Regenerate only if the signing key rotates, on the control
-  plane: `manage.py export_release_pubkey > /nfs/pow3rtool/RCON/release-pubkey.txt`.
+- The RCON source mounted (or a clone).
+- `release-pubkey.txt` present in `RCON/` (your Ed25519 **release public key**).
+  Export it from your own control plane:
+  `manage.py export_release_pubkey > /opt/rcon/release-pubkey.txt`.
+  Export only the public key; keep the private signing key on the control plane.
 
 ## Compile
 ```bash
-cd /nfs/pow3rtool/RCON
+cd /opt/rcon
 ./build.sh v0.3.0                 # → dist/rcon-linux-amd64, dist/rcon-linux-arm64
 ./build.sh v0.3.0 linux/amd64     # a single platform
+./build.sh v0.4.0-windows-lab.1 windows/amd64 # Windows lab executable (.exe)
 ```
 `build.sh` bakes the **version** and the **release pubkey** into the binary,
 builds **static** (`CGO_ENABLED=0` — no libc dependency on the target), and runs
@@ -32,13 +40,13 @@ The version string is what shows in `rcon --version`, the node's `/health`, and
 the self-update version comparison — **bump it every release** or self-update
 won't trigger.
 
-## Cut a release (on the control plane / orthanc-vm)
+## Cut a release (on the control plane)
 Compiling produces binaries; **publishing signs + registers them**, and
 **promoting points a cohort at the version**:
 ```bash
 # 1. sign + register the artifact (Ed25519 over version|os|arch|sha256)
-manage.py publish_release v0.3.0 --binary /nfs/pow3rtool/RCON/dist/rcon-linux-amd64
-manage.py publish_release v0.3.0 --binary /nfs/pow3rtool/RCON/dist/rcon-linux-arm64 --arch arm64
+manage.py publish_release v0.3.0 --binary /opt/rcon/dist/rcon-linux-amd64
+manage.py publish_release v0.3.0 --binary /opt/rcon/dist/rcon-linux-arm64 --arch arm64
 
 # 2. promote to a cohort — only nodes on that channel converge
 manage.py promote_release canary v0.3.0      # scream-test group first
@@ -67,5 +75,8 @@ flag.)
   `remote_run` a `curl …/bootstrap/binary` + service restart) — see history.
 - **Cross-arch:** `build.sh` cross-compiles (pure Go, `CGO_ENABLED=0`), so one
   build host produces every target. No need for Go on the runtime VMs.
-- **Windows/macOS** targets aren't wired yet (the service-install + paths assume
-  Linux); add platforms to `build.sh` when needed.
+- **Windows**: the lab build uses a LocalSystem service, PowerShell 5.1, software
+  CNG keys, and Windows Job Objects. See WINDOWS.md. Automatic self-update is
+  explicitly unsupported; do not promote Windows builds to Linux channels.
+- Set `RCON_BUILD_DIR` to an isolated output directory for regression builds
+  without replacing bootstrap artifacts. macOS is not implemented.

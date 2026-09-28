@@ -63,3 +63,9 @@ approval) and **signed self-update**. See [`../ARCHITECTURE.md`](../ARCHITECTURE
 | `smoke_test.py` | **conformance suite** — to run against the Go agent |
 
 See [`../ARCHITECTURE.md`](../ARCHITECTURE.md) for the full fabric design.
+
+## Local identity path
+
+Linux defaults to `/etc/rcon`. Existing installations using a different location
+must retain their explicit `--etc` argument when upgrading. Windows uses its
+protected ProgramData directory; see [WINDOWS.md](WINDOWS.md).

@@ -1,3 +1,5 @@
+//go:build linux
+
 // RCON service install — the NON-INTERACTIVE fleet path.
 //
 //	rcon install --token <join-token> --xconnect https://<xconnect-fqdn>
@@ -35,18 +37,16 @@ func runInstall(args []string) {
 	token := fs.String("token", "", "join token (required) — the only credential a fresh box needs")
 	broker := fs.String("broker", "", "broker address for the service (default: <xconnect-host>:3)")
 	name := fs.String("name", "", "requested node name (default hostname)")
-	insecure := fs.Bool("insecure", false, "skip TLS verify on the bootstrap fetch (ONLY for a self-signed origin; pair with --ca-pin). The broker tunnel is always pinned mTLS regardless")
-	caPin := fs.String("ca-pin", "", "out-of-band CA pin (sha256:<hex>) verifying the enrollment trust bundle — defeats enrollment-time MITM")
+	insecure := fs.Bool("insecure", false, "unsupported: install the bootstrap CA in the OS trust store")
+	caPin := fs.String("ca-pin", "", "additional out-of-band CA pin (sha256:<hex>) verifying the enrollment trust bundle")
 	unitPath := fs.String("unit", "/etc/systemd/system/rcon.service", "systemd unit path to write")
 	_ = fs.Parse(args)
 
 	if *xc == "" || *token == "" {
 		log.Fatalf("install: --xconnect and --token are both required")
 	}
-	if *insecure && strings.TrimSpace(*caPin) == "" {
-		log.Fatalf("install: refusing --insecure without --ca-pin sha256:<fp> — enrollment would be " +
-			"MITM-able and the attacker becomes this node's permanent control plane. " +
-			"Pass --ca-pin (from the console) or drop --insecure to use verified TLS.")
+	if err := validateBootstrapURL(*xc, *insecure); err != nil {
+		log.Fatalf("install: %v", err)
 	}
 	brokerAddr := *broker
 	if brokerAddr == "" {
@@ -80,12 +80,7 @@ func runInstall(args []string) {
 	//    finishes at fork, so boot never waits on approval/connect.
 	// The join token + CA pin are read from the environment (EnvironmentFile),
 	// NEVER placed on the command line — so the fleet credential never lands in
-	// `ps` / journald / `systemctl show`. Only the non-secret --insecure flag is
-	// baked into ExecStart.
-	extra := ""
-	if *insecure {
-		extra += " --insecure"
-	}
+	// `ps` / journald / `systemctl show`.
 	unit := fmt.Sprintf(`[Unit]
 Description=Pow3rtool RCON agent (self-enrolling)
 After=network-online.target
@@ -97,7 +92,7 @@ EnvironmentFile=%s
 # ExecStart self-enrolls (waits for approval) if there's no cert yet, then serves
 # — all in ONE process. Type=simple => the systemd start job completes at fork, so
 # the boot transaction is never blocked waiting for an operator to approve us.
-ExecStart=%s --etc %s --broker ${RCON_BROKER} --enroll-if-needed --xconnect ${RCON_XCONNECT_URL} --name ${RCON_NAME}%s
+ExecStart=%s --etc %s --broker ${RCON_BROKER} --enroll-if-needed --xconnect ${RCON_XCONNECT_URL} --name ${RCON_NAME}
 Restart=always
 RestartSec=5
 # RCON is a privileged root admin agent BY DESIGN (full rationale in
@@ -109,7 +104,7 @@ RestrictRealtime=true
 
 [Install]
 WantedBy=multi-user.target
-`, envPath, exe, *etc, extra)
+`, envPath, exe, *etc)
 	if err := os.WriteFile(*unitPath, []byte(unit), 0o644); err != nil {
 		log.Fatalf("install: write %s (need root?): %v", *unitPath, err)
 	}

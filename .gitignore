@@ -18,6 +18,8 @@ etc/
 *.key
 
 # build artifacts + stray binaries (never commit binaries to the public repo).
+*.exe
+*.zip
 # Keep dist/ docs (DEPLOY.md, rcon.service) — only the compiled binaries are ignored.
 dist/rcon-*
 /xconnect

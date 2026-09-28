@@ -11,11 +11,8 @@ package main
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
@@ -36,11 +33,11 @@ import (
 
 func runEnroll(args []string) {
 	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
-	etc := fs.String("etc", "/nfs/pow3rtool/RCON/etc", "identity dir to write device-key/cert + trust-bundle")
+	etc := fs.String("etc", defaultIdentityDir(), "identity directory")
 	xc := fs.String("xconnect", "", "XConnect bootstrap base URL, e.g. https://<xconnect-fqdn> (required; nginx /bootstrap)")
 	token := fs.String("token", os.Getenv("RCON_JOIN_TOKEN"), "join token (the only credential a fresh box needs); defaults to $RCON_JOIN_TOKEN so it stays off the command line")
 	name := fs.String("name", "", "requested node name (defaults to hostname)")
-	insecure := fs.Bool("insecure", false, "skip TLS verify on the bootstrap fetch (ONLY for a genuinely self-signed origin; pair with --ca-pin)")
+	insecure := fs.Bool("insecure", false, "unsupported: bootstrap requires verified HTTPS; install your CA in the OS trust store")
 	caPin := fs.String("ca-pin", os.Getenv("RCON_CA_PIN"), "out-of-band CA pin (sha256:<hex of root SPKI>); defaults to $RCON_CA_PIN")
 	ifNeeded := fs.Bool("if-needed", false, "no-op if a valid device cert is already present (for ExecStartPre)")
 	poll := fs.Duration("poll", 5*time.Second, "approval poll interval")
@@ -83,9 +80,10 @@ func runEnroll(args []string) {
 // --enroll-if-needed, so the systemd service can do the waiting in-process instead
 // of a foreground CLI (and without blocking boot — see runInstall).
 func enrollAndAwait(etc, xc, token, reqName string, insecure bool, caPin string, poll, timeout time.Duration) error {
-	if xc == "" {
-		return fmt.Errorf("--xconnect (XConnect bootstrap base URL) is required")
+	if err := validateBootstrapURL(xc, insecure); err != nil {
+		return err
 	}
+	xc = strings.TrimRight(xc, "/")
 	if token == "" {
 		return fmt.Errorf("--token (join token) is required")
 	}
@@ -94,7 +92,10 @@ func enrollAndAwait(etc, xc, token, reqName string, insecure bool, caPin string,
 	}
 
 	// 1. Device keypair (EC P-256, matches the reference enroll contract).
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err := ensureIdentityDir(etc); err != nil {
+		return err
+	}
+	key, err := createDeviceKey(etc)
 	if err != nil {
 		return fmt.Errorf("keygen: %w", err)
 	}
@@ -107,38 +108,28 @@ func enrollAndAwait(etc, xc, token, reqName string, insecure bool, caPin string,
 	}
 	csrPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
 
-	// Persist the key now (0600) so a crash mid-poll doesn't orphan the pending row.
-	if err := os.MkdirAll(etc, 0o700); err != nil {
-		return fmt.Errorf("mkdir %s: %w", etc, err)
-	}
-	keyDER, _ := x509.MarshalECPrivateKey(key)
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-	if err := os.WriteFile(filepath.Join(etc, "device-key.pem"), keyPEM, 0o600); err != nil {
-		return fmt.Errorf("write device-key.pem: %w", err)
-	}
-
-	if insecure && strings.TrimSpace(caPin) == "" {
-		// Hard refusal (not a warning): --insecure with no out-of-band pin means
-		// an on-path attacker at enrollment can hand back its own trust bundle and
-		// become this node's PERMANENT control plane. Require the pin or real TLS.
-		return fmt.Errorf("refusing to enroll: --insecure requires --ca-pin sha256:<fp> " +
-			"(out-of-band CA pin) — otherwise enrollment is MITM-able; drop --insecure to use verified TLS")
-	}
-
-	client := bootstrapClient(insecure)
+	client := bootstrapClient()
 
 	// 3. Register → PENDING.
-	reg, err := bootCall(client, "POST", xc+"/bootstrap/enroll", map[string]any{
-		"join_token": token, "csr": csrPEM, "name": reqName})
+	enrollID, err := pendingEnrollmentID(etc, xc, key)
 	if err != nil {
-		return fmt.Errorf("register: %w", err)
+		return err
 	}
-	enrollID, _ := reg["enrollment_id"].(string)
 	if enrollID == "" {
-		return fmt.Errorf("no enrollment_id in response: %v", reg)
+		reg, err := bootCall(client, "POST", xc+"/bootstrap/enroll", map[string]any{
+			"join_token": token, "csr": csrPEM, "name": reqName})
+		if err != nil {
+			return fmt.Errorf("register: %w", err)
+		}
+		enrollID, _ = reg["enrollment_id"].(string)
+		if enrollID == "" {
+			return fmt.Errorf("no enrollment_id in response: %v", reg)
+		}
+		if err := savePendingEnrollment(etc, xc, enrollID, key); err != nil {
+			return err
+		}
 	}
-	log.Printf("enroll: registered %q → enrollment %s (state=%v). Waiting for operator approval…",
-		reqName, enrollID, reg["state"])
+	log.Printf("enroll: %q → enrollment %s. Waiting for operator approval…", reqName, enrollID)
 
 	// 4. Poll until approved (or revoked / timeout).
 	var deadline time.Time
@@ -158,8 +149,8 @@ func enrollAndAwait(etc, xc, token, reqName string, insecure bool, caPin string,
 					return fmt.Errorf("active but cert/trust_bundle missing in response")
 				}
 				// Out-of-band trust check: if a CA pin was supplied, the received
-				// bundle MUST match it before we pin it forever — this is what
-				// makes enrollment safe even over an unverified channel.
+				// bundle MUST match it. This is additional to verified HTTPS;
+				// checking the returned CA cannot protect a token already sent.
 				if err := verifyCAPin([]byte(bundle), caPin); err != nil {
 					return err
 				}
@@ -192,7 +183,7 @@ func enrollAndAwait(etc, xc, token, reqName string, insecure bool, caPin string,
 // (survives logout/reboot). Derives the broker from the --xconnect host (:3) when
 // --broker isn't given. Needs root (writing /etc/systemd + systemctl); logs and
 // returns on failure rather than aborting a successful enrollment.
-func installService(etc, broker, xc string) {
+func installLinuxService(etc, broker, xc string) {
 	if broker == "" {
 		if u, err := url.Parse(xc); err == nil && u.Hostname() != "" {
 			broker = u.Hostname() + ":3"
@@ -249,12 +240,24 @@ func haveValidCert(etc string) bool {
 	return time.Now().Before(c.NotAfter)
 }
 
-func bootstrapClient(insecure bool) *http.Client {
-	tr := &http.Transport{}
+func validateBootstrapURL(raw string, insecure bool) error {
 	if insecure {
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // TOFU: join token is the credential
+		return fmt.Errorf("--insecure is no longer supported: install the bootstrap server CA in the OS trust store; --ca-pin does not protect the join token in transit")
 	}
-	return &http.Client{Timeout: 30 * time.Second, Transport: tr}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
+		return fmt.Errorf("--xconnect must be an HTTPS base URL without credentials, query, or fragment")
+	}
+	return nil
+}
+
+func bootstrapClient() *http.Client {
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{}, // OS trust roots, including enterprise CAs.
+		// Even a 307/308 must not forward the join-token body to another URL.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 func bootCall(c *http.Client, method, url string, body map[string]any) (map[string]any, error) {
@@ -267,6 +270,10 @@ func bootCall(c *http.Client, method, url string, body map[string]any) (map[stri
 	if err != nil {
 		return nil, err
 	}
+	// Also guard direct callers; polling URLs may contain a query string.
+	if req.URL.Scheme != "https" || req.URL.Hostname() == "" || req.URL.User != nil {
+		return nil, fmt.Errorf("bootstrap requires verified HTTPS")
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -278,7 +285,7 @@ func bootCall(c *http.Client, method, url string, body map[string]any) (map[stri
 	data, _ := io.ReadAll(resp.Body)
 	var out map[string]any
 	_ = json.Unmarshal(data, &out)
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if out != nil {
 			if e, ok := out["error"]; ok {
 				return out, fmt.Errorf("HTTP %d: %v", resp.StatusCode, e)
@@ -295,6 +302,7 @@ func bootCall(c *http.Client, method, url string, body map[string]any) (map[stri
 // until the next restart re-loads the now-tokenless file; the persistent on-disk
 // copy (the thing a /read or a later boot would surface) is what this removes.
 func purgeJoinToken(etc string) {
+	purgePlatformJoinToken(etc)
 	p := filepath.Join(etc, "enroll.env")
 	data, err := os.ReadFile(p)
 	if err != nil {

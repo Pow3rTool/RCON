@@ -14,10 +14,8 @@ import (
 	"net/http"
 	"os"
 	"os/user"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
 const (
@@ -60,22 +58,15 @@ func editFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "old_string and new_string are identical"})
 		return
 	}
-	info, err := os.Stat(body.Path)
+	f, err := openRegularFile(body.Path, os.O_RDWR)
 	if err != nil {
-		writeJSON(w, 404, map[string]any{"error": "not found", "path": body.Path})
+		fileError(w, err)
 		return
 	}
-	if info.IsDir() {
-		writeJSON(w, 400, map[string]any{"error": "path is a directory"})
-		return
-	}
-	if info.Size() > maxReadBytes {
-		writeJSON(w, 413, map[string]any{"error": "file too large for safe edit"})
-		return
-	}
-	raw, err := os.ReadFile(body.Path)
+	defer f.Close()
+	raw, err := readBoundedFile(f)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		fileError(w, err)
 		return
 	}
 	if probeNUL(raw) {
@@ -107,7 +98,7 @@ func editFile(w http.ResponseWriter, r *http.Request) {
 	} else {
 		out = []byte(strings.Replace(text, old, nw, 1))
 	}
-	if err := os.WriteFile(body.Path, out, info.Mode().Perm()); err != nil {
+	if err := replaceOpenedFile(f, out); err != nil {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
 	}
@@ -209,6 +200,10 @@ func writeFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "path and content required"})
 		return
 	}
+	if !supportsPOSIXMetadata && (body.Owner != "" || body.Group != "" || body.Mode != "") {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "POSIX owner/group/mode are not supported on Windows; use explicit Windows ACL commands"})
+		return
+	}
 	mode, modeSet, err := parseWriteMode(body.Mode)
 	if err != nil {
 		writeJSON(w, 400, map[string]any{"error": err.Error()})
@@ -224,10 +219,40 @@ func writeFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": err.Error()})
 		return
 	}
-	exists := false
-	if info, err := os.Stat(body.Path); err == nil && !info.IsDir() {
-		exists = true
-		cur, _, _ := hashFile(body.Path)
+	p, err := newFileTarget(body.Path)
+	if err != nil {
+		fileError(w, err)
+		return
+	}
+	defer p.Close()
+	f, err := p.OpenRegular(os.O_RDWR)
+	exists := err == nil
+	if os.IsNotExist(err) {
+		if body.Expected != "" {
+			writeJSON(w, 409, map[string]any{"error": "stale", "message": "file no longer exists; re-read"})
+			return
+		}
+		if body.MakeDirs {
+			if err := p.MakeParents(); err != nil {
+				fileError(w, err)
+				return
+			}
+		}
+		// A file appearing after the first open must not be overwritten blindly.
+		f, err = p.OpenRegular(os.O_RDWR | os.O_CREATE | os.O_EXCL)
+	}
+	if err != nil {
+		fileError(w, err)
+		return
+	}
+	defer f.Close()
+	if exists && (body.Expected != "" || !body.Force) {
+		raw, err := readBoundedFile(f)
+		if err != nil {
+			fileError(w, err)
+			return
+		}
+		cur := shaBytes(raw)
 		if body.Expected != "" {
 			if body.Expected != cur {
 				writeJSON(w, 409, map[string]any{"error": "stale", "current_hash": cur,
@@ -240,23 +265,15 @@ func writeFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if body.MakeDirs {
-		if dir := filepath.Dir(body.Path); dir != "" {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				writeJSON(w, 500, map[string]any{"error": "create parent directories: " + err.Error()})
-				return
-			}
-		}
-	}
 	out := []byte(*body.Content)
-	if err := os.WriteFile(body.Path, out, 0o644); err != nil {
+	if err := replaceOpenedFile(f, out); err != nil {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
 	}
 	// Apply ownership before an explicit mode: chown can clear set-id bits on
 	// Linux, and this ordering guarantees the requested final permission bits.
 	if uid != -1 || gid != -1 {
-		if err := os.Chown(body.Path, uid, gid); err != nil {
+		if err := f.Chown(uid, gid); err != nil {
 			auditRecord("write", body.Path, 1, 0, body.Rid)
 			writeJSON(w, 500, map[string]any{"error": "apply ownership: " + err.Error(),
 				"content_written": true})
@@ -264,14 +281,14 @@ func writeFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if modeSet {
-		if err := os.Chmod(body.Path, mode); err != nil {
+		if err := f.Chmod(mode); err != nil {
 			auditRecord("write", body.Path, 1, 0, body.Rid)
 			writeJSON(w, 500, map[string]any{"error": "apply mode: " + err.Error(),
 				"content_written": true})
 			return
 		}
 	}
-	info, err := os.Stat(body.Path)
+	info, err := f.Stat()
 	if err != nil {
 		auditRecord("write", body.Path, 1, 0, body.Rid)
 		writeJSON(w, 500, map[string]any{"error": "stat written file: " + err.Error(),
@@ -281,10 +298,7 @@ func writeFile(w http.ResponseWriter, r *http.Request) {
 	response := map[string]any{"ok": true, "path": body.Path,
 		"created": !exists, "bytes": len(out), "hash": shaBytes(out),
 		"mode": fmt.Sprintf("%04o", info.Mode().Perm())}
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		response["uid"] = st.Uid
-		response["gid"] = st.Gid
-	}
+	addFileMetadata(response, info)
 	auditRecord("write", body.Path, 0, 0, body.Rid)
 	writeJSON(w, 200, response)
 }
@@ -306,7 +320,12 @@ func probeNUL(b []byte) bool {
 // hashFile returns the sha256 (hex) of a file's full contents + its size — the
 // token an edit/write must echo back (read-before-write guard).
 func hashFile(path string) (string, int, error) {
-	data, err := os.ReadFile(path)
+	f, err := openRegularFile(path, os.O_RDONLY)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	data, err := readBoundedFile(f)
 	if err != nil {
 		return "", 0, err
 	}
@@ -334,23 +353,15 @@ func readFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "path required"})
 		return
 	}
-	info, err := os.Stat(body.Path)
+	f, err := openRegularFile(body.Path, os.O_RDONLY)
 	if err != nil {
-		writeJSON(w, 404, map[string]any{"error": err.Error()})
+		fileError(w, err)
 		return
 	}
-	if info.IsDir() {
-		writeJSON(w, 400, map[string]any{"error": "path is a directory"})
-		return
-	}
-	if info.Size() > maxReadBytes {
-		writeJSON(w, 413, map[string]any{
-			"error": fmt.Sprintf("file too large to read/hash (%d > %d bytes)", info.Size(), maxReadBytes)})
-		return
-	}
-	data, err := os.ReadFile(body.Path)
+	defer f.Close()
+	data, err := readBoundedFile(f)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		fileError(w, err)
 		return
 	}
 	sum := sha256.Sum256(data)

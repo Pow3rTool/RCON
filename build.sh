@@ -13,11 +13,12 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+cd "$HERE"
 VERSION="${1:?usage: build.sh <version> [os/arch ...]}"
 shift || true
 PLATFORMS=("$@"); [ ${#PLATFORMS[@]} -eq 0 ] && PLATFORMS=(linux/amd64 linux/arm64)
 GO="${GO:-$(command -v go || echo /usr/local/go/bin/go)}"
-OUT="$HERE/dist"
+OUT="${RCON_BUILD_DIR:-$HERE/dist}"
 
 PUBKEY="${RCON_RELEASE_PUBKEY:-$(cat "$HERE/release-pubkey.txt" 2>/dev/null || true)}"
 if [ -z "$PUBKEY" ]; then
@@ -31,8 +32,13 @@ echo "rcon $VERSION  ·  pubkey ${PUBKEY:0:12}…  ·  $GO ($($GO version | awk 
 for plat in "${PLATFORMS[@]}"; do
   os="${plat%/*}"; arch="${plat#*/}"
   out="$OUT/rcon-$os-$arch"
+  case "$os" in
+    windows) out="$out.exe" ;;
+    linux) ;;
+    *) echo "FATAL: unsupported OS: $os (supported: linux, windows)" >&2; exit 1 ;;
+  esac
   CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" "$GO" build \
-    -ldflags "-s -w -X main.version=$VERSION -X main.releasePubKeyB64=$PUBKEY" \
+    -trimpath -ldflags "-s -w -X main.version=$VERSION -X main.releasePubKeyB64=$PUBKEY" \
     -o "$out" "$HERE"
 
   # GUARD 1: the pubkey MUST be baked in, or self-update can't verify -> brick.
@@ -45,10 +51,9 @@ for plat in "${PLATFORMS[@]}"; do
     echo "FATAL: $out is dynamically linked — set CGO_ENABLED=0" >&2
     rm -f "$out"; exit 1
   fi
-  printf "  ✓ %s  (%s, static, pubkey verified)\n" "$out" "$(du -h "$out" | cut -f1)"
+  printf "  ✓ %s  (%s bytes, CGO disabled, pubkey verified)\n" "$out" "$(stat -c %s "$out")"
 done
 
 echo
-echo "next: publish + sign + promote (on the control plane):"
-echo "  manage.py publish_release $VERSION --binary dist/rcon-linux-amd64"
-echo "  manage.py promote_release canary $VERSION"
+echo "Artifacts ready. Linux: publish/sign/promote on the control plane (see BUILD.md)."
+echo "Windows lab: manual installation/upgrades only; see WINDOWS.md. Do not promote to Linux channels."

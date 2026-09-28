@@ -42,7 +42,7 @@ func dropCurConn() {
 	}
 }
 
-func loadDeviceKey(etc string) (any, error) {
+func loadPEMDeviceKey(etc string) (crypto.Signer, error) {
 	raw, err := os.ReadFile(filepath.Join(etc, "device-key.pem"))
 	if err != nil {
 		return nil, err
@@ -55,7 +55,9 @@ func loadDeviceKey(etc string) (any, error) {
 		return k, nil
 	}
 	if k, e := x509.ParsePKCS8PrivateKey(blk.Bytes); e == nil {
-		return k, nil
+		if signer, ok := k.(crypto.Signer); ok {
+			return signer, nil
+		}
 	}
 	return nil, fmt.Errorf("unsupported device key format")
 }
@@ -123,12 +125,7 @@ func renewApply(etc string) http.HandlerFunc {
 			writeJSON(w, 500, map[string]any{"error": "load device key: " + err.Error()})
 			return
 		}
-		signer, ok := key.(crypto.Signer)
-		if !ok {
-			writeJSON(w, 500, map[string]any{"error": "device key is not a signer"})
-			return
-		}
-		ourPub, e1 := x509.MarshalPKIXPublicKey(signer.Public())
+		ourPub, e1 := x509.MarshalPKIXPublicKey(key.Public())
 		newPub, e2 := x509.MarshalPKIXPublicKey(crt.PublicKey)
 		if e1 != nil || e2 != nil || !bytes.Equal(ourPub, newPub) {
 			writeJSON(w, 400, map[string]any{"error": "refusing renew: cert is not for our device key (key-continuity violation)"})

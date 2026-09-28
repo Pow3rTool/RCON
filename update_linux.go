@@ -1,3 +1,5 @@
+//go:build linux
+
 // RCON self-update — receive an Orthanc-SIGNED binary relayed down the tunnel by
 // XConnect, verify it against the BAKED release public key (XConnect is only a
 // relay — it can never vouch for code), gate it through --selftest, atomically
@@ -27,10 +29,6 @@ import (
 
 // Baked at build time:
 //   -ldflags "-X main.version=v0.2.0 -X main.releasePubKeyB64=<raw-b64-ed25519-pub>"
-var (
-	version          = "dev"
-	releasePubKeyB64 = ""
-)
 
 // protocolVersion is the WIRE-CONTRACT version of the RCON tool surface +
 // control RPCs (run/jobs/read/edit/write/renew/update/health) — NOT the release
@@ -38,7 +36,6 @@ var (
 // Additive changes (new verbs/fields) do NOT bump it; callers feature-detect.
 // Reported in /health so XConnect/Orthanc can enforce a minimum-supported floor
 // (a node below the floor is allowed to self-update/renew but not serve verbs).
-const protocolVersion = 1
 
 const watchdogWindow = 90 * time.Second
 

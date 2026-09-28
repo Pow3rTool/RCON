@@ -5,7 +5,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,7 +14,6 @@ import (
 	"os/user"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -50,7 +48,7 @@ func childEnv(extra ...string) []string {
 	base := os.Environ()
 	out := make([]string, 0, len(base)+len(extra))
 	for _, kv := range base {
-		if i := strings.IndexByte(kv, '='); i >= 0 && sensitiveEnvKeys[kv[:i]] {
+		if i := strings.IndexByte(kv, '='); i >= 0 && sensitiveEnvKeys[strings.ToUpper(kv[:i])] {
 			continue
 		}
 		out = append(out, kv)
@@ -117,21 +115,26 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout*float64(time.Second)))
 	defer cancel()
-	c := exec.CommandContext(ctx, "/bin/bash", "-c", runWrapper)
-	c.Env = childEnv("__TS_CWD="+cwd, "__TS_CMD="+command, "__TS_STATE="+stateFile)
-	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // own process group
-	// On timeout, kill the WHOLE group (children too), not just the shell.
-	c.Cancel = func() error {
-		if c.Process != nil {
-			return syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
-		}
-		return nil
+	c, tree, err := newShellCommand(ctx, command, cwd, stateFile, false)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": "prepare command: " + err.Error()})
+		return
 	}
-	var outBuf, errBuf bytes.Buffer
+	defer tree.Close()
+	outBuf, errBuf := cappedBuffer{limit: outputCap}, cappedBuffer{limit: outputCap}
 	c.Stdout, c.Stderr = &outBuf, &errBuf
 
 	t0 := time.Now()
-	err := c.Run()
+	err = c.Start()
+	if err == nil {
+		if startErr := tree.Started(c); startErr != nil {
+			_ = c.Process.Kill()
+			_ = c.Wait()
+			err = startErr
+		} else {
+			err = c.Wait()
+		}
+	}
 	dur := time.Since(t0).Seconds()
 	timedOut := ctx.Err() == context.DeadlineExceeded
 
@@ -169,6 +172,10 @@ func runHandler(w http.ResponseWriter, r *http.Request) {
 		errb, truncated = errb[:outputCap], true
 	}
 	stderr := string(errb)
+	if err != nil && rc == -1 {
+		stderr += "\n" + err.Error()
+	}
+	truncated = truncated || outBuf.truncated || errBuf.truncated
 	if timedOut {
 		stderr += "\n(killed: exceeded timeout)"
 	}
