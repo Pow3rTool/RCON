@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -18,18 +17,29 @@ import (
 )
 
 const commandShell = "powershell"
-const supportsSelfUpdate = false
+const supportsSelfUpdate = true
 const supportsPOSIXMetadata = false
 
-func windowsDataDir() string {
-	path, err := windows.KnownFolderPath(windows.FOLDERID_ProgramData, 0)
-	if err != nil {
-		log.Fatalf("locate ProgramData: %v", err)
-	}
-	return filepath.Join(path, "Pow3rTool", "RCON")
+// RCON owns exactly one tree, fixed on purpose: no known-folder lookups and no
+// environment-dependent paths. Every directory in it is created with a
+// protected SYSTEM/Administrators-only DACL (ensureIdentityDir) — never the
+// DACL a new folder would otherwise inherit from C:\, which grants
+// Authenticated Users modify rights on everything below it.
+//
+//	C:\RCON\releases\<version>\rcon.exe   the service runs one of these
+//	C:\RCON\etc\                          device cert, trust bundle, service.json
+//	C:\RCON\logs\                         service.log, audit.log, upgrade.log
+//	C:\RCON\state\                        upgrade lock/journal, health marker, last result
+const defaultWindowsRoot = `C:\RCON`
+
+// A variable only so tests can point it at a temporary tree; nothing else sets it.
+var windowsRoot = defaultWindowsRoot
+
+func windowsPath(elem ...string) string {
+	return filepath.Join(append([]string{windowsRoot}, elem...)...)
 }
-func defaultIdentityDir() string { return windowsDataDir() }
-func defaultAuditPath() string   { return filepath.Join(windowsDataDir(), "audit.log") }
+func defaultIdentityDir() string { return windowsPath("etc") }
+func defaultAuditPath() string   { return windowsPath("logs", "audit.log") }
 func platformOSVersion() string {
 	v := windows.RtlGetVersion()
 	return fmt.Sprintf("Windows %d.%d build %d", v.MajorVersion, v.MinorVersion, v.BuildNumber)
@@ -78,19 +88,17 @@ func loadDeviceCertificate(etc string) (tls.Certificate, error) {
 	}
 	return cert, nil
 }
-func markHealthy()    {}
-func updateWatchdog() {}
-func updateApply(etc, broker string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusNotImplemented, map[string]any{
-			"error": "Windows lab build requires a manual service stop/replace/start upgrade", "applied": false})
-	}
-}
 func runSelfTest(etc, broker string) {
 	pub, err := base64.StdEncoding.DecodeString(releasePubKeyB64)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		log.Fatal("selftest: missing/invalid baked release verification key")
 	}
+	// The same startup path the service runs before connecting to SCM.
+	_, f, err := servicePreflight(etc)
+	if err != nil {
+		log.Fatalf("selftest: %v", err)
+	}
+	_ = f.Close()
 	if _, _, err := buildTLS(etc); err != nil {
 		log.Fatalf("selftest: %v", err)
 	}

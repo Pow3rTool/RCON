@@ -10,18 +10,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $binary = Join-Path $PSScriptRoot 'rcon.exe'
 if (-not (Test-Path -LiteralPath $binary)) { throw "Missing $binary; extract the complete ZIP first." }
-$secureToken = Read-Host 'Orthanc join token' -AsSecureString
-$tokenPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
-try {
-    $env:RCON_JOIN_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenPointer)
-    $rconArguments = @('install', '--xconnect', $XConnect, '--name', $Name)
-    if ($Broker) { $rconArguments += @('--broker', $Broker) }
-    if ($CAPin) { $rconArguments += @('--ca-pin', $CAPin) }
-    & $binary @rconArguments
-    if ($LASTEXITCODE -ne 0) { throw "RCON installation failed (exit $LASTEXITCODE). See the message above." }
-} finally {
-    Remove-Item Env:RCON_JOIN_TOKEN -ErrorAction SilentlyContinue
-    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer)
-    $secureToken.Dispose()
-}
+# rcon.exe prompts for the join token itself with console echo off, so the
+# token never reaches the command line, an environment variable, or history.
+$rconArguments = @('install', '--xconnect', $XConnect, '--name', $Name)
+if ($Broker) { $rconArguments += @('--broker', $Broker) }
+if ($CAPin) { $rconArguments += @('--ca-pin', $CAPin) }
+& $binary @rconArguments
+if ($LASTEXITCODE -ne 0) { throw "RCON installation failed (exit $LASTEXITCODE). See the message above." }
 Get-Service -Name Pow3rToolRCON
