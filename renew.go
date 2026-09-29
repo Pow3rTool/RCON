@@ -178,7 +178,8 @@ func renewApply(etc string) http.HandlerFunc {
 			return
 		}
 
-		if err := os.WriteFile(filepath.Join(etc, "device-cert.pem"), []byte(body.Certificate), 0o644); err != nil {
+		// Atomic replace: a truncated device cert would lock the node out.
+		if err := replaceFileAtomic(filepath.Join(etc, "device-cert.pem"), []byte(body.Certificate), 0o644); err != nil {
 			writeJSON(w, 500, map[string]any{"error": "write cert: " + err.Error()})
 			return
 		}

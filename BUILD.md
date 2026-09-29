@@ -65,7 +65,8 @@ flag.)
   target on connect (and the operator can force it with `/update?node=`); if
   behind, it relays the **signed** binary down the tunnel. The node verifies the
   signature against its baked pubkey → `--selftest` → atomic swap → re-exec, with
-  keep-previous + watchdog auto-rollback.
+  keep-previous + watchdog auto-rollback. Windows nodes follow the staged
+  drain/swap path described in WINDOWS.md instead of an in-place swap.
 
 ## Gotchas
 - **Never hand-roll `go build` for a release.** Use `build.sh` — the inline
@@ -75,8 +76,12 @@ flag.)
   `remote_run` a `curl …/bootstrap/binary` + service restart) — see history.
 - **Cross-arch:** `build.sh` cross-compiles (pure Go, `CGO_ENABLED=0`), so one
   build host produces every target. No need for Go on the runtime VMs.
-- **Windows**: the lab build uses a LocalSystem service, PowerShell 5.1, software
-  CNG keys, and Windows Job Objects. See WINDOWS.md. Automatic self-update is
-  explicitly unsupported; do not promote Windows builds to Linux channels.
+- **Windows**: the build uses a LocalSystem service, PowerShell 5.1, software
+  CNG keys, and Windows Job Objects. See WINDOWS.md. Windows releases use the same
+  signed channel, published per OS: `manage.py publish_release v0.5.0 --binary
+  dist/rcon-windows-amd64.exe --os windows` then `manage.py promote_release canary
+  v0.5.0 --os windows`. The node never replaces its running executable: it stages
+  the release in its own directory, drains, and hands off to a swapper that
+  repoints the service and rolls back if the new version doesn't come up healthy.
 - Set `RCON_BUILD_DIR` to an isolated output directory for regression builds
   without replacing bootstrap artifacts. macOS is not implemented.

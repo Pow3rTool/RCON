@@ -9,11 +9,6 @@
 package main
 
 import (
-	"crypto/ed25519"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -61,57 +56,22 @@ func runSelfTest(etc, broker string) {
 	os.Exit(0)
 }
 
-func updateApply(etc, broker string) http.HandlerFunc {
+func updateApply(etc, broker string, _ *JobStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Version   string `json:"version"`
-			GOOS      string `json:"goos"`
-			GOARCH    string `json:"goarch"`
-			SHA256    string `json:"sha256"`
-			Signature string `json:"signature"`
-			BinaryB64 string `json:"binary_b64"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, 400, map[string]any{"error": "bad body"})
-			return
-		}
-		goos, goarch := req.GOOS, req.GOARCH
-		if goos == "" {
-			goos = runtime.GOOS
-		}
-		if goarch == "" {
-			goarch = runtime.GOARCH
-		}
-		if goos != runtime.GOOS || goarch != runtime.GOARCH {
-			writeJSON(w, 400, map[string]any{"error": "arch mismatch for this node"})
+		req, status, err := decodeReleaseRequest(w, r)
+		if err != nil {
+			writeJSON(w, status, map[string]any{"error": err.Error()})
 			return
 		}
 		if req.Version == version {
 			writeJSON(w, 200, map[string]any{"applied": false, "reason": "already on " + version})
 			return
 		}
-		bin, err := base64.StdEncoding.DecodeString(req.BinaryB64)
-		if err != nil || len(bin) == 0 {
-			writeJSON(w, 400, map[string]any{"error": "bad binary_b64"})
-			return
-		}
-		// (1) content hash
-		sum := sha256.Sum256(bin)
-		if hex.EncodeToString(sum[:]) != req.SHA256 {
-			writeJSON(w, 400, map[string]any{"error": "sha256 mismatch"})
-			return
-		}
-		// (2) signature over version|goos|goarch|sha256 — BAKED pubkey only
-		pub, err := base64.StdEncoding.DecodeString(releasePubKeyB64)
-		if err != nil || len(pub) != ed25519.PublicKeySize {
-			writeJSON(w, 500, map[string]any{"error": "no/invalid baked release pubkey"})
-			return
-		}
-		sig, _ := base64.StdEncoding.DecodeString(req.Signature)
-		manifest := []byte(fmt.Sprintf("%s|%s|%s|%s", req.Version, goos, goarch, req.SHA256))
-		if !ed25519.Verify(ed25519.PublicKey(pub), manifest, sig) {
-			log.Printf("update: SIGNATURE INVALID for %s — refusing", req.Version)
-			writeJSON(w, 403, map[string]any{"error": "signature verification failed"})
+		// (1) content hash + (2) signature over version|goos|goarch|sha256 —
+		// BAKED pubkey only (shared with every platform: update_common.go).
+		bin, status, err := verifyRelease(req)
+		if err != nil {
+			writeJSON(w, status, map[string]any{"error": err.Error()})
 			return
 		}
 		// (3) write candidate next to the running exe

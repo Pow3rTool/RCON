@@ -67,5 +67,6 @@ See [`../ARCHITECTURE.md`](../ARCHITECTURE.md) for the full fabric design.
 ## Local identity path
 
 Linux defaults to `/etc/rcon`. Existing installations using a different location
-must retain their explicit `--etc` argument when upgrading. Windows uses its
-protected ProgramData directory; see [WINDOWS.md](WINDOWS.md).
+must retain their explicit `--etc` argument when upgrading. Windows uses one
+fixed, protected tree at `C:\RCON` (releases, identity, logs, state); see
+[WINDOWS.md](WINDOWS.md).

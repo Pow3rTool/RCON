@@ -10,10 +10,13 @@ import (
 	"crypto/sha256"
 	"encoding/asn1"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
+	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"unsafe"
@@ -40,7 +43,22 @@ func utf16(s string) *uint16 { p, _ := windows.UTF16PtrFromString(s); return p }
 func ncError(op string, status uintptr) error {
 	return fmt.Errorf("CNG %s failed: 0x%08x", op, uint32(status))
 }
+
+var pinnedKeyNameRE = regexp.MustCompile(`^Pow3rTool-RCON-[0-9a-f]{32}$`)
+
+// cngKeyName names this identity's machine key. A name pinned in service.json
+// wins, so an identity directory can move without orphaning its key (which is
+// non-exportable and cannot be renamed). Otherwise it derives from the path.
 func cngKeyName(etc string) (string, error) {
+	if b, err := os.ReadFile(filepath.Join(etc, "service.json")); err == nil {
+		var cfg windowsServiceConfig
+		if json.Unmarshal(b, &cfg) == nil && cfg.KeyName != "" {
+			if !pinnedKeyNameRE.MatchString(cfg.KeyName) {
+				return "", fmt.Errorf("service.json key_name %q is not an RCON device key name", cfg.KeyName)
+			}
+			return cfg.KeyName, nil
+		}
+	}
 	path, err := filepath.Abs(etc)
 	if err != nil {
 		return "", err

@@ -55,5 +55,5 @@ for plat in "${PLATFORMS[@]}"; do
 done
 
 echo
-echo "Artifacts ready. Linux: publish/sign/promote on the control plane (see BUILD.md)."
-echo "Windows lab: manual installation/upgrades only; see WINDOWS.md. Do not promote to Linux channels."
+echo "Artifacts ready. Publish/sign/promote on the control plane (see BUILD.md);"
+echo "Windows releases publish with --os windows and upgrade through the staged swap in WINDOWS.md."

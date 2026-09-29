@@ -134,6 +134,12 @@ func NewJobStore() *JobStore {
 // theater against a caller XConnect already let through.
 func (s *JobStore) Start(cmdStr, rid string) (*Job, error) {
 	s.mu.Lock()
+	// Checked under s.mu so an upgrade's idle check (Running, same lock) either
+	// sees this job or this call sees the drain — never neither.
+	if r := drainReason(); r != "" {
+		s.mu.Unlock()
+		return nil, errDraining{r}
+	}
 	if cap := maxConcurrentJobs(); cap > 0 {
 		running := 0
 		for _, j := range s.jobs {
@@ -195,6 +201,19 @@ func (s *JobStore) Start(cmdStr, rid string) (*Job, error) {
 		auditRecord("job", cmdStr, exit, j.Dur(), rid)
 	}()
 	return j, nil
+}
+
+// Running counts jobs whose process has not exited yet.
+func (s *JobStore) Running() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, j := range s.jobs {
+		if st, _ := j.snapshotState(); st == "running" {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *JobStore) Get(id string) *Job {

@@ -22,6 +22,8 @@ func pendingEnrollmentID(etc, xc string, key crypto.Signer) (string, error) { re
 func savePendingEnrollment(etc, xc, id string, key crypto.Signer) error     { return nil }
 func purgePlatformJoinToken(etc string)                                     {}
 
+func lastUpgradeReport() map[string]any     { return nil }
+func pendingUpgradeReport() map[string]any  { return nil }
 func defaultIdentityDir() string            { return "/etc/rcon" }
 func defaultAuditPath() string              { return "/var/lib/rcon/audit.log" }
 func platformCommand(args []string) bool    { return false }

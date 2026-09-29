@@ -198,35 +198,47 @@ func mux(svid string, store *JobStore, etc, broker string) http.Handler {
 
 	m.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		markHealthy() // feeds the post-update rollback watchdog
-		writeJSON(w, 200, map[string]any{
+		res := map[string]any{
 			"ok": true, "node": svid, "version": version, "protocol": protocolVersion,
 			"goos": runtime.GOOS, "goarch": runtime.GOARCH,
 			"shell": commandShell, "os_version": platformOSVersion(),
 			"capabilities": map[string]bool{"self_update": supportsSelfUpdate, "posix_metadata": supportsPOSIXMetadata},
-			"time":         time.Now().UTC().Format(time.RFC3339)})
+			"time":         time.Now().UTC().Format(time.RFC3339)}
+		// Additive fields: callers that don't know them ignore them.
+		if d := drainReason(); d != "" {
+			res["draining"] = d
+		}
+		if u := lastUpgradeReport(); u != nil {
+			res["last_upgrade"] = u
+		}
+		if p := pendingUpgradeReport(); p != nil {
+			res["pending_upgrade"] = p
+		}
+		writeJSON(w, 200, res)
 	})
 
 	// Self-update: XConnect relays an Orthanc-SIGNED binary down the tunnel.
-	m.HandleFunc("POST /update/apply", updateApply(etc, broker))
+	m.HandleFunc("POST /update/apply", updateApply(etc, broker, store))
 
 	// File primitives (ported from reference/exec_daemon.py). read→edit→write,
 	// with the read-before-write hash guard (optimistic concurrency).
+	// Everything that changes the node is gated() so an upgrade can drain it (drain.go).
 	m.HandleFunc("POST /read", readFile)
-	m.HandleFunc("POST /edit", editFile)
-	m.HandleFunc("POST /write", writeFile)
+	m.HandleFunc("POST /edit", gated(editFile))
+	m.HandleFunc("POST /write", gated(writeFile))
 	// Metadata writes use a distinct additive endpoint so a newer XConnect
 	// routed to an older RCON fails closed with 404 instead of having the old
 	// JSON decoder silently ignore owner/group/mode and report a false success.
-	m.HandleFunc("POST /write-metadata", writeFile)
+	m.HandleFunc("POST /write-metadata", gated(writeFile))
 
 	// Cert renewal (XConnect-driven, over the tunnel): CSR out, signed cert in.
 	m.HandleFunc("GET /renew/csr", renewCSR(etc))
-	m.HandleFunc("POST /renew/apply", renewApply(etc))
+	m.HandleFunc("POST /renew/apply", gated(renewApply(etc)))
 
 	// Fast, synchronous one-shot (full exec_daemon /run contract: timeout,
 	// separate stdout/stderr, dur, truncated, session-cwd). Lose-and-retry on a
 	// blip; use /jobs for anything long-running.
-	m.HandleFunc("POST /run", runHandler)
+	m.HandleFunc("POST /run", gated(runHandler))
 
 	// Long-running job: survives tunnel blips, reattach by cursor, explicit cancel.
 	m.HandleFunc("POST /jobs", func(w http.ResponseWriter, r *http.Request) {
@@ -244,8 +256,12 @@ func mux(svid string, store *JobStore, etc, broker string) http.Handler {
 		}
 		j, err := store.Start(body.Cmd, body.Rid)
 		if err != nil {
-			// Transient backpressure (concurrent-job cap), not an authz denial —
-			// 429 + retryable so the caller/LLM slows down instead of giving up.
+			// Transient backpressure (concurrent-job cap or upgrade drain), not an
+			// authz denial — retryable so the caller/LLM waits instead of giving up.
+			if _, ok := err.(errDraining); ok {
+				writeJSON(w, 503, map[string]any{"error": err.Error(), "retryable": true, "draining": true})
+				return
+			}
 			writeJSON(w, 429, map[string]any{"error": err.Error(), "retryable": true})
 			return
 		}
