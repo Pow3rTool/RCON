@@ -202,7 +202,7 @@ func mux(svid string, store *JobStore, etc, broker string) http.Handler {
 			"ok": true, "node": svid, "version": version, "protocol": protocolVersion,
 			"goos": runtime.GOOS, "goarch": runtime.GOARCH,
 			"shell": commandShell, "os_version": platformOSVersion(),
-			"capabilities": map[string]bool{"self_update": supportsSelfUpdate, "posix_metadata": supportsPOSIXMetadata},
+			"capabilities": map[string]bool{"self_update": supportsSelfUpdate, "posix_metadata": supportsPOSIXMetadata, "desktop": supportsDesktop},
 			"time":         time.Now().UTC().Format(time.RFC3339)}
 		// Additive fields: callers that don't know them ignore them.
 		if d := drainReason(); d != "" {
@@ -239,6 +239,7 @@ func mux(svid string, store *JobStore, etc, broker string) http.Handler {
 	// separate stdout/stderr, dur, truncated, session-cwd). Lose-and-retry on a
 	// blip; use /jobs for anything long-running.
 	m.HandleFunc("POST /run", gated(runHandler))
+	m.HandleFunc("POST /desktop", gated(desktopHandler))
 
 	// Long-running job: survives tunnel blips, reattach by cursor, explicit cancel.
 	m.HandleFunc("POST /jobs", func(w http.ResponseWriter, r *http.Request) {

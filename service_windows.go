@@ -79,6 +79,11 @@ func platformCommand(args []string) bool {
 		return false
 	}
 	switch args[0] {
+	case "desktop-worker":
+		if err := runDesktopWorker(args[1:]); err != nil {
+			log.Fatal(err)
+		}
+		return true
 	case "swap":
 		runSwap(args[1:])
 		return true
@@ -231,6 +236,8 @@ func (s *rconWindowsService) Execute(args []string, requests <-chan svc.ChangeRe
 	defer f.Close()
 	log.SetOutput(f)
 	s.cfg = cfg
+	stopDesktopSafety := startDesktopSafetySupervisor()
+	defer stopDesktopSafety()
 	armPendingUpgrade() // watchdog or settling for an upgrade in flight at startup
 	go func() {
 		_ = os.Setenv("RCON_JOIN_TOKEN", s.cfg.Token)

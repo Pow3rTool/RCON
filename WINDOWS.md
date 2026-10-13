@@ -252,4 +252,171 @@ join token) also works if you want a new identity.
 - Reads and hash checks are bounded at 10 MB. Edit/write keep the checked file
   handle through modification; the hash guard is optimistic concurrency, not a
   lock against other processes changing the same open file.
-- Log rotation is not implemented; monitor `C:\RCON\logs`.
+- Service, upgrade, and audit logs do not rotate; monitor `C:\RCON\logs`.
+  Desktop diagnostics rotate separately as described below.
+
+
+## Native desktop operations
+
+Windows RCON advertises `capabilities.desktop=true` and handles `POST /desktop`
+on its existing authenticated reverse tunnel. XConnect requires the existing
+`full` grant for observation and input. Its MCP tools require an explicit node;
+`session_id` is optional for observation/tasks when exactly one logged-on session
+is active. A node running an older RCON receives an upgrade-required response.
+No desktop-specific Orthanc grant or per-host allow-list is used.
+
+The service launches the same executable with the private `desktop-worker`
+subcommand in the selected session, using a duplicated SYSTEM token. The worker
+is suspended until assigned to a kill-on-close Job Object. A random local named
+pipe permits SYSTEM only, rejects remote clients, and verifies both process IDs.
+Each worker receives a minimal environment. Capture/input workers perform one
+operation and exit; the activity-indicator worker lives for a bounded idle lease.
+There is no PowerShell helper, scheduled task, copied executable, or GUI TCP port.
+The service installation's protected ACLs are unchanged. The worker remains
+SYSTEM, so these tools require full machine authority, not a restricted GUI grant.
+
+During desktop operations, a native click-through, non-activating overlay draws a
+2-DIP purple (#b388ff) border around each monitor and a top-right RCON status badge.
+The badge distinguishes AI viewing, AI controlling, AI thinking, AI idle, and AI interrupted. It is advisory,
+not proof of application success or a security boundary. It expires after 30
+seconds without another operation; the worker independently expires after 35
+seconds, and service termination closes its kill-on-close job. Session/logon,
+lock, and display changes are checked while it is visible. Only the interrupted badge accepts a local click to resume; it has no separate
+network endpoint. If the indicator cannot be shown, the operation is
+refused. Windows capture exclusion keeps the overlay out of the model's frames;
+it does not flash off around each screenshot. The overlay is also omitted from
+window metadata. The public desktop capability reports `visual_indicator=true`.
+
+Capture uses GDI and returns a bounded JPEG plus physical desktop geometry,
+window rectangles, DPI, and cursor metadata. Coordinates for input use the image
+pixels in that exact frame. Each gesture releases its own keys/buttons before
+returning. The native endpoint validates the action independently of XConnect.
+A screenshot taken during foreground changes remains available for inspection
+with `actionable=false`; it cannot authorize gestures. Frames expire after 180 seconds and bind to the session's logon identity, screen
+geometry, and foreground window. The last-input tick is diagnostic-only; RDP
+key-state synchronization can advance it without a meaningful action. Input consumes the frame before
+dispatch, including uncertain outcomes; changed or consumed frames require a new
+observation. Screenshots and typed text are omitted from node audit records.
+
+An existing unlocked and rendered Windows desktop is required. This capability
+does not log in, unlock, accept UAC prompts, or reconnect/transfer RDP sessions.
+An RDP session can report Active while its display is unusable; restore its viewer
+or deliberately transfer it to the local console. Session 0 is never selected.
+Multiple active sessions require an explicit selection. A sent receipt confirms
+input dispatch, not application success. Observe after timeouts before deciding
+whether to retry; restarting the service invalidates all previous frames.
+
+Native integration tests opt in with `RCON_TEST_DESKTOP=1`. Run the test binary as
+SYSTEM outside a session-0 command Job Object: Windows forbids cross-session
+children inside that inherited job. The test captures and sends a reversible
+cursor gesture, then verifies duplicate-request and consumed-frame refusal.
+`RCON_TEST_DESKTOP_OUTPUT` optionally writes the JPEG to a protected local file.
+Temporary task scheduling may be used to launch the test harness; product runtime
+uses only the native worker and never Task Scheduler.
+
+The opt-in test executable also supports `indicator-fixture OUTPUT_DIRECTORY`,
+run as the logged-on user on a rendered desktop. It compares application pixels
+before and during capture exclusion, temporarily includes the overlay to save a
+visual preview, and checks that showing it did not change focus. This command
+exists only in the test binary, not the shipped RCON executable.
+
+
+## Interactive desktop input (held-v1)
+
+Upgraded Windows nodes advertise `interaction_protocol: held-v1`. XConnect's
+`desktop_interact` exposes a caller-owned interaction with a 60-second default
+lease (1–60 seconds configurable per call) and a five-minute absolute lifetime.
+Ordinary `desktop_act`/`desktop_task` still release all input within each gesture.
+
+Begin with a fresh ordinary `desktop_observe` frame. Send a bounded list of
+`key_down`, `key_up`, `key_press`, `button_down`, `button_up`, `move`, `wait`, or
+`capture` events. Keys are individual names; use separate events for modifiers.
+For KiCad's preset switcher: `key_down CTRL`, `key_press TAB`, `wait 200`; inspect
+the returned menu while Ctrl stays held. Continue with the returned interaction
+ID and final frame ID, or release to commit the selection. Cancellation releases
+owned input too; application key-up behavior still applies.
+
+Timed moves accept 1–4 intermediate samples. Each response has at most six JPEGs
+including the final checkpoint, under 3.6 MB decoded in total. Images carry
+elapsed time, cursor, held-input, and phase metadata. Only the final checkpoint
+can authorize another action; intermediate frames are inspection-only. Capture
+cost can lengthen gestures; this is sampled feedback, not a real-time video loop.
+
+The purple indicator displays **AI controlling** during events and **AI thinking**
+while waiting for the next model decision, then **AI idle** after release. It
+remains excluded from screenshots and does not steal focus. Normal activity
+badges are click-through. Outside Escape latches **AI interrupted · click to
+resume**; that badge alone becomes clickable. Held input is released, and new
+input requests remain blocked until a local badge click clears the protected
+`state/desktop-paused.json` record. The pause survives service restarts.
+Observations and cleanup remain available; remote retries cannot resume it.
+
+The same RCON executable hosts a session-bound interaction worker. A private
+SYSTEM-only pipe with mutual PID checks carries bounded requests. Unlike ordinary
+short-lived workers, its job does not kill it when the service disappears: pipe
+EOF lets it send key-up/button-up before exiting. It also independently enforces
+its lease and lifetime. A stopped process cannot itself run cleanup; a hard worker
+crash or hung Windows input subsystem still requires operator recovery.
+
+Marked SendInput events and a low-level keyboard hook distinguish RCON Escape
+from outside Escape. Three distinct outside Escape presses within 1.5 seconds pause control; mouse activity,
+other keys, redundant releases, timestamp changes, and image animation do not.
+Secure desktop/session/geometry changes or unexpected
+foreground changes between decisions end the interaction and release held input.
+Authorization and ownership are checked on each broker call. Expired, consumed,
+and non-final checkpoints cannot be used to continue. After an uncertain result,
+release or allow the lease to expire, then observe; never replay events blindly.
+
+Validation: `RCON_TEST_INTERACTION=1` opts into TestDesktopInteractionLifecycle
+on an active rendered session, launched as SYSTEM outside a containing job. It
+holds only CTRL, checks stale-frame/timeout/pipe-loss cleanup, and samples a
+reversible pointer move. The regular native suite skips live input by default.
+
+
+The native service now supervises a passive keyboard watcher in each active logon
+session. Triple Escape also works while idle, after the purple indicator hides,
+and across desktop calls. A held Escape key's autorepeat and RCON-tagged Escape
+never count as taps. No keyboard text is collected or stored. Logoff stops that
+session's watcher; a new logon starts another. This does not log in or unlock Windows.
+The durable pause is independent of gesture leases. A local badge click clears it;
+resume requires a new observation and new interaction, never replaying held input.
+Pause/resume transitions are recorded in logs/desktop-pause.jsonl without pixels.
+AI thinking shows the seconds until owned input releases (maximum 60 seconds per
+checkpoint, five minutes per interaction). AI waiting shows the 30-second inactivity window until the indicator
+hides; it does not assert whether the model has finished thinking. The paused badge has no timeout. The listener remains armed after idle hides.
+
+Clearing the local pause hides the indicator immediately; it does not fabricate a
+new waiting period or resume an ended gesture. A later desktop call shows activity
+again. The paused badge uses the standard hand pointer; private worker startup
+suppresses Windows app-starting cursor feedback. The Escape watcher stays armed.
+
+Client diagnostics are local to `logs/desktop-pause.jsonl`, with two rotated files
+and a 1 MiB target per file. They include each distinct outside Escape tap (burst
+count, whether a pause was requested, pause state when logged), watcher lifecycle,
+pause IDs, banner clicks with elapsed pause time, and desktop-call receipts.
+Hooks enqueue bounded diagnostic records without doing file IO. Logs never include
+other key values, typed text, input event arrays, or screenshot bytes.
+
+### Purple AI pointer
+
+The native indicator also visualizes RCON's own tagged mouse events: a purple
+arrow at the injected position, expanding button-down rings, a short fading
+movement trail, and L/R/M markers while those buttons are held. It is automatic
+for both ordinary gestures and held interactions; no extra MCP calls are needed.
+The pointer fades after 1.8 seconds without mouse activity, but remains visible
+while a button is held. Pausing or dismissing the indicator clears it. It does
+not follow human mouse input and does not replace the application's real cursor.
+
+Rendering uses the same nonactivating, click-through, capture-excluded window as
+the border. Model frames retain unobscured application pixels and ordinary cursor
+metadata. Native event positions are mapped per monitor, including negative
+desktop origins and per-monitor DPI. A dedicated mouse-hook thread keeps capture
+and drawing work out of the hook. Its bounded history is RAM-only. Failure to
+install this advisory visual hook is logged as pointer-monitor-unavailable and
+does not change the existing mandatory activity-banner or input safety rules.
+
+The opt-in test executable supports `pointer-fixture OUTPUT_DIRECTORY`. It draws
+a temporary inert canvas, sends test input only onto that canvas, verifies tagged
+input tracking/click-through/held state/pause cleanup and capture exclusion, saves
+preview evidence, and restores the original pointer position. It requires a
+rendered logged-on desktop and is not part of unattended regression tests.
