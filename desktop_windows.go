@@ -213,9 +213,17 @@ func nativeDesktop(c desktopCommand) (result map[string]any) {
 		label = "AI controlling"
 	}
 	err = setDesktopIndicator(session, label)
-	// Activation and console attach briefly leave no foreground window; an
-	// observation can wait that out. Input never retries.
-	for i := 0; err != nil && c.Op == "observe" && strings.Contains(err.Error(), errDesktopNoForeground.Error()) && i < 8; i++ {
+	// Activation and console attach briefly leave no foreground window, and
+	// taking a session from a live RDP client passes through the secure desktop
+	// (measured: about a second). An observation waits that out; input never retries.
+	transient, tries := func(err error) bool {
+		return err != nil && c.Op == "observe" && (strings.Contains(err.Error(), errDesktopNoForeground.Error()) ||
+			(attached != nil && strings.Contains(err.Error(), "locked or secure desktop")))
+	}, 8
+	if attached != nil {
+		tries = 24
+	}
+	for i := 0; transient(err) && i < tries; i++ {
 		time.Sleep(250 * time.Millisecond)
 		err = setDesktopIndicator(session, label)
 	}
