@@ -76,7 +76,8 @@ func clearDesktopPause(id string) error {
 	})
 }
 func desktopInputPaused(c desktopCommand) bool {
-	return c.Op == "act" || (c.Op == "interact" && c.Interaction != nil && (c.Interaction.Operation == "begin" || c.Interaction.Operation == "continue"))
+	// attach_console changes which session the console shows, so a human's pause blocks it too.
+	return c.Op == "act" || c.Op == "attach_console" || (c.Interaction != nil && c.Op == "interact" && (c.Interaction.Operation == "begin" || c.Interaction.Operation == "continue"))
 }
 
 // Serialize writers across the service, watchdogs and UI worker. Locking the OS

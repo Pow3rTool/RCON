@@ -130,3 +130,50 @@ func TestDesktopSettleRidesOutActivation(t *testing.T) {
 		t.Fatal("a desktop with no foreground should wait out the limit and leave the verdict to the snapshot", err)
 	}
 }
+func TestDesktopUnavailableExplainsState(t *testing.T) {
+	rdp := desktopSessionState{ID: 2, User: `HOST\three`, Station: "RDP-Tcp#13", State: "active"}
+	gone := desktopSessionState{ID: 2, User: `HOST\three`, State: "disconnected"}
+	other := desktopSessionState{ID: 3, User: `HOST\ops`, Station: "Console", State: "active", Console: true}
+	noFG := "desktop indicator: indicator unavailable: " + errDesktopNoForeground.Error()
+	noActive := "no active logged-on Windows session; log in or reconnect first"
+	for name, tc := range map[string]struct {
+		all     []desktopSessionState
+		id      uint32
+		failure string
+		want    string
+	}{
+		"minimized rdp":        {[]desktopSessionState{rdp}, 2, noFG, "rdp_display_suppressed"},
+		"console no focus":     {[]desktopSessionState{other}, 3, noFG, "no_foreground"},
+		"locked":               {[]desktopSessionState{rdp}, 2, "desktop worker: locked or secure desktop; no capture or input", "locked_or_secure_desktop"},
+		"closed rdp":           {[]desktopSessionState{gone}, 0, noActive, "session_disconnected"},
+		"closed rdp by id":     {[]desktopSessionState{gone, other}, 2, "select an active session_id from sessions", "session_disconnected"},
+		"nobody":               {nil, 0, noActive, "no_user_session"},
+		"two active":           {[]desktopSessionState{rdp, other}, 0, "select an active session_id from sessions", "session_ambiguous"},
+		"unknown id":           {[]desktopSessionState{rdp}, 9, "select an active session_id from sessions", "session_not_found"},
+		"unrelated failure":    {[]desktopSessionState{rdp}, 2, "frame unavailable or consumed; observe again", ""},
+		"paused is not a hint": {[]desktopSessionState{rdp}, 2, "AI interrupted; click the top-right RCON badge to resume remote input", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, remedy := desktopUnavailable(tc.all, tc.id, tc.failure)
+			if got != tc.want || (got != "" && remedy == "") {
+				t.Fatalf("got %q (%q), want %q", got, remedy, tc.want)
+			}
+		})
+	}
+}
+func TestDesktopAttachConsoleProtocol(t *testing.T) {
+	id := strings.Repeat("a", 32)
+	if err := validateDesktopCommand(desktopCommand{ID: id, Op: "attach_console", SessionID: 2, Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []desktopCommand{
+		{ID: id, Op: "attach_console"},
+		{ID: id, Op: "attach_console", SessionID: 2, FrameID: id},
+		{ID: id, Op: "attach_console", SessionID: 2, DesktopAction: DesktopAction{Action: "key", Key: "ENTER"}},
+		{ID: id, Op: "observe", Force: true},
+	} {
+		if validateDesktopCommand(c) == nil {
+			t.Fatalf("accepted %+v", c)
+		}
+	}
+}

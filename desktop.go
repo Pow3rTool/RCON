@@ -49,6 +49,18 @@ type desktopCommand struct {
 	WaitMS    int    `json:"wait_ms,omitempty"`
 	DesktopAction
 	Interaction *DesktopInteraction `json:"interaction,omitempty"`
+	// attach_console only: allow disconnecting a connected client or console user.
+	Force bool `json:"force,omitempty"`
+}
+
+// Every logged-on session, including ones no tool can drive right now, so a
+// caller sees why a desktop is unavailable instead of guessing at Win32 errors.
+type desktopSessionState struct {
+	ID      uint32 `json:"session_id"`
+	User    string `json:"user"`
+	Station string `json:"station,omitempty"`
+	State   string `json:"state"` // active, disconnected, connected, ...
+	Console bool   `json:"console"`
 }
 type desktopBounds struct{ X, Y, Width, Height int }
 type desktopGuard struct {
@@ -82,7 +94,14 @@ func validateDesktopCommand(c desktopCommand) error {
 	if c.Op != "interact" && c.Interaction != nil {
 		return errors.New("interaction fields require interact")
 	}
+	if c.Force && c.Op != "attach_console" {
+		return errors.New("force only applies to attach_console")
+	}
 	switch c.Op {
+	case "attach_console":
+		if c.SessionID == 0 || c.FrameID != "" || c.DesktopAction != (DesktopAction{}) {
+			return errors.New("attach_console requires session_id and no frame or input")
+		}
 	case "interact":
 		if c.DesktopAction != (DesktopAction{}) {
 			return errors.New("interaction cannot contain legacy action fields")
@@ -153,6 +172,53 @@ func matchDesktopForeground(m *DesktopWindowMatch, class, title string) error {
 }
 
 var errDesktopNoForeground = errors.New("no usable foreground desktop; restore the RDP display or use the local console")
+
+// Explains why a desktop cannot be observed or driven: a stable code and what
+// would fix it. Returns "" for failures that are not about desktop availability.
+func desktopUnavailable(all []desktopSessionState, id uint32, failure string) (string, string) {
+	switch {
+	case strings.Contains(failure, errDesktopNoForeground.Error()):
+		for _, s := range all {
+			if s.ID == id && strings.HasPrefix(strings.ToUpper(s.Station), "RDP-") {
+				return "rdp_display_suppressed", "This session's RDP client is minimized or not drawing, so Windows renders nothing, not even for the user's own programs. Ask its user to restore the window (or set RemoteDesktop_SuppressWhenMinimized=2, a DWORD under HKCU\\Software\\Microsoft\\Terminal Server Client, on their client), or call desktop_attach_console with force=true, which disconnects that client and shows the session on the console."
+			}
+		}
+		return "no_foreground", "No window has focus (display switching, off or blank). Observe again in a moment; if it persists, check the console."
+	case strings.Contains(failure, "locked or secure desktop"), strings.Contains(failure, "input desktop unavailable"):
+		return "locked_or_secure_desktop", "The session is locked or showing a secure desktop (UAC, sign-in). These tools cannot unlock or answer it; a human must."
+	case !strings.Contains(failure, "no active logged-on Windows session") && !strings.Contains(failure, "select an active session_id"):
+		return "", ""
+	}
+	var requested *desktopSessionState
+	active, disconnected := 0, 0
+	for i, s := range all {
+		if id != 0 && s.ID == id {
+			requested = &all[i]
+		}
+		switch s.State {
+		case "active":
+			active++
+		case "disconnected":
+			disconnected++
+		}
+	}
+	disconnectedHint := "The session is logged on but disconnected, so it has no display. Reconnect its RDP client, or call desktop_attach_console with its session_id to show it on the console (same user and running programs)."
+	switch {
+	case requested != nil && requested.State == "disconnected":
+		return "session_disconnected", disconnectedHint
+	case requested != nil && requested.State != "active":
+		return "session_not_active", "That session is " + requested.State + ", not active. Pick an active session_id from sessions."
+	case requested == nil && id != 0:
+		return "session_not_found", "No logged-on session has that session_id; pick one from sessions."
+	case id == 0 && active > 1:
+		return "session_ambiguous", "Several sessions are active; pass session_id from sessions."
+	case id == 0 && active == 0 && disconnected > 0:
+		return "session_disconnected", disconnectedHint
+	case id == 0 && active == 0:
+		return "no_user_session", "Nobody is logged on. These tools do not log in; a human must sign in at the console or over RDP."
+	}
+	return "", ""
+}
 
 // Polls until focus and geometry hold still for settle, or limit passes. This is
 // a bounded settling period, not proof that an asynchronous app task completed.

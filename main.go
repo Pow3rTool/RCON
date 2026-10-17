@@ -202,7 +202,7 @@ func mux(svid string, store *JobStore, etc, broker string) http.Handler {
 			"ok": true, "node": svid, "version": version, "protocol": protocolVersion,
 			"goos": runtime.GOOS, "goarch": runtime.GOARCH,
 			"shell": commandShell, "os_version": platformOSVersion(),
-			"capabilities": map[string]bool{"self_update": supportsSelfUpdate, "posix_metadata": supportsPOSIXMetadata, "desktop": supportsDesktop},
+			"capabilities": map[string]bool{"self_update": supportsSelfUpdate, "posix_metadata": supportsPOSIXMetadata, "desktop": supportsDesktop, "desktop_console": supportsDesktop},
 			"time":         time.Now().UTC().Format(time.RFC3339)}
 		// Additive fields: callers that don't know them ignore them.
 		if d := drainReason(); d != "" {

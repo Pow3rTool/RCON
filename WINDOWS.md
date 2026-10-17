@@ -315,7 +315,32 @@ Store apps such as Settings or the Text Input Application), and minimized window
 are listed by identity only, without their off-screen rectangles.
 
 An existing unlocked and rendered Windows desktop is required. This capability
-does not log in, unlock, accept UAC prompts, or reconnect/transfer RDP sessions.
+does not log in, unlock, or accept UAC prompts.
+
+When no desktop can be observed or driven, the failure carries `desktop_state`,
+a one-line `remedy`, and every logged-on session with its user, station, state
+and whether it is on the console. Measured on Windows 10 (October 2026):
+
+- `rdp_display_suppressed`: the session is Active over RDP but its client is
+  minimized. The client asks the server to stop sending output, and Windows then
+  has no foreground window and refuses screen capture even to the user's own
+  programs. Setting `RemoteDesktop_SuppressWhenMinimized=2` (DWORD, under
+  `HKCU\Software\Microsoft\Terminal Server Client`) on the client machine keeps
+  it rendering while minimized.
+- `session_disconnected`: the RDP client was closed without signing out. The
+  session keeps running but has no input desktop or display.
+- `locked_or_secure_desktop`, `no_user_session`, `session_ambiguous`,
+  `session_not_found`, `session_not_active`, `no_foreground` cover the rest.
+
+`attach_console` (MCP `desktop_attach_console`) is the `tscon <id> /dest:console`
+primitive, through `WTSConnectSession` as LocalSystem. It moves the same logon
+session, with the same user and running programs, onto the console display,
+which renders without any client; a later RDP connection takes it back.
+Without `force` it refuses a session still connected over RDP and a console
+already showing another user's active session; `force` disconnects that client or
+user. A durable pause blocks it like input. The result is a fresh observation of
+the attached session at the console's resolution. The node audit records each
+attach with the session's previous state and station.
 An RDP session can report Active while its display is unusable; restore its viewer
 or deliberately transfer it to the local console. Session 0 is never selected.
 Multiple active sessions require an explicit selection. A sent receipt confirms

@@ -108,7 +108,19 @@ func selectDesktopSession(sessions []desktopSession, id uint32) (desktopSession,
 	return desktopSession{}, errors.New("select an active session_id from sessions")
 }
 func nativeDesktop(c desktopCommand) (result map[string]any) {
-	defer func() { desktopAuditCall(c, result) }()
+	requested := c // attach_console continues as an observe; log what was asked
+	defer func() { desktopAuditCall(requested, result) }()
+	selected := c.SessionID
+	var attached map[string]any
+	defer func() {
+		annotateDesktopUnavailable(result, selected)
+		// A failure after attaching still changed which session the console shows.
+		for k, v := range attached {
+			if result != nil {
+				result[k] = v
+			}
+		}
+	}()
 	fail := func(err error) map[string]any { return desktopFailure(c.ID, "not_sent", err) }
 	if !desktopSystem() {
 		return fail(errors.New("desktop requires the LocalSystem RCON service"))
@@ -162,6 +174,15 @@ func nativeDesktop(c desktopCommand) (result map[string]any) {
 			return fail(errors.New("desktop interaction active; continue or release it before other gestures"))
 		}
 	}
+	if c.Op == "attach_console" {
+		note, failure := attachDesktopConsole(c)
+		if failure != nil {
+			return failure
+		}
+		attached = note
+		// Report the result as a fresh observation of the attached session.
+		c.Op, c.Force, c.WaitMS = "observe", false, 1000
+	}
 	sessions, err := desktopSessions()
 	if err != nil {
 		return fail(err)
@@ -172,6 +193,7 @@ func nativeDesktop(c desktopCommand) (result map[string]any) {
 		out["sessions"] = sessions
 		return out
 	}
+	selected = session.ID
 	if err := ensureDesktopSafety(session); err != nil {
 		return fail(err)
 	}
@@ -190,7 +212,14 @@ func nativeDesktop(c desktopCommand) (result map[string]any) {
 	if c.Op == "act" {
 		label = "AI controlling"
 	}
-	if err := setDesktopIndicator(session, label); err != nil {
+	err = setDesktopIndicator(session, label)
+	// Activation and console attach briefly leave no foreground window; an
+	// observation can wait that out. Input never retries.
+	for i := 0; err != nil && c.Op == "observe" && strings.Contains(err.Error(), errDesktopNoForeground.Error()) && i < 8; i++ {
+		time.Sleep(250 * time.Millisecond)
+		err = setDesktopIndicator(session, label)
+	}
+	if err != nil {
 		return fail(fmt.Errorf("desktop indicator: %w", err))
 	}
 	defer func() { _ = setDesktopIndicator(session, "AI idle") }()
