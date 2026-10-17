@@ -1,6 +1,6 @@
 // RCON's opt-in console sign-in provider. It has no stored credentials and no
 // network client. Only a live, local SYSTEM RCON service can supply a one-use
-// credential, and only at an empty console. Built-in providers remain intact.
+// credential, only for an empty console or its locked local robot session. Built-in providers remain intact.
 #define SECURITY_WIN32
 #include <windows.h>
 #include <credentialprovider.h>
@@ -19,20 +19,39 @@ struct Ticket { DWORD magic, session; ULONGLONG expires; WCHAR user[32], domain[
 #pragma pack(pop)
 static_assert(sizeof(Ticket)==274, "Go protocol must match");
 
-static bool EmptyConsole(DWORD session) {
+// Only an empty console or the locked local robot console is eligible. Every
+// other logged-on user (even disconnected) blocks credential consumption.
+// MinGW's headers omit WTSINFOEX. Only its documented, fixed-width prefix is
+// needed here, matching desktop_lock.go (Level + aligned level-1 union).
+struct WTSInfoExPrefix { DWORD level, padding, session, state; LONG flags; };
+static_assert(sizeof(WTSInfoExPrefix)==20,"WTSINFOEX prefix ABI");
+static bool EligibleConsole(DWORD session) {
     if (WTSGetActiveConsoleSessionId()!=session) return false;
+    WCHAR computer[MAX_COMPUTERNAME_LENGTH+1]; DWORD chars=ARRAYSIZE(computer);
+    if(!GetComputerNameW(computer,&chars)) return false;
     PWTS_SESSION_INFOW rows=nullptr; DWORD count=0;
-    if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE,0,1,&rows,&count)) return false;
-    bool empty=true;
-    for (DWORD i=0;i<count;i++) {
-        if (rows[i].SessionId==0 || rows[i].State==WTSListen) continue;
+    if(!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE,0,1,&rows,&count)) return false;
+    bool ok=true;
+    for(DWORD i=0;i<count;i++) {
+        if(rows[i].SessionId==0 || rows[i].State==WTSListen) continue;
         LPWSTR name=nullptr; DWORD bytes=0;
-        if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, rows[i].SessionId, WTSUserName, &name,&bytes)) { empty=false; break; }
-        if (name && *name) empty=false;
+        if(!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE,rows[i].SessionId,WTSUserName,&name,&bytes)) {ok=false;break;}
+        bool present=name && *name;
+        bool own=present && _wcsicmp(name,L"rcon-operator")==0 && rows[i].SessionId==session && rows[i].State==WTSActive;
         WTSFreeMemory(name);
-        if (!empty) break;
+        if(!present) continue;
+        if(!own) {ok=false;break;}
+        LPWSTR domain=nullptr;
+        if(!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE,session,WTSDomainName,&domain,&bytes)) {ok=false;break;}
+        ok=domain && _wcsicmp(domain,computer)==0; WTSFreeMemory(domain);
+        if(!ok) break;
+        LPWSTR info=nullptr;
+        if(!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE,session,static_cast<WTS_INFO_CLASS>(25),&info,&bytes)) {ok=false;break;}
+        auto ex=reinterpret_cast<WTSInfoExPrefix*>(info);
+        ok=info && bytes>=sizeof(WTSInfoExPrefix) && ex->level==1 && ex->session==session && ex->flags==0;
+        WTSFreeMemory(info); if(!ok) break;
     }
-    WTSFreeMemory(rows); return empty;
+    WTSFreeMemory(rows);return ok;
 }
 static bool TrustedServer(HANDLE pipe) {
     ULONG pid=0;
@@ -63,6 +82,7 @@ class Provider final : public ICredentialProvider, public ICredentialProviderCre
     UINT_PTR adviseContext=0;
     HWND window=nullptr;
     DWORD session=0;
+    CREDENTIAL_PROVIDER_USAGE_SCENARIO scenario=CPUS_INVALID;
     Ticket ticket={};
     bool ready=false;
     void Clear() { SecureZeroMemory(&ticket,sizeof(ticket)); ready=false; }
@@ -73,8 +93,8 @@ class Provider final : public ICredentialProvider, public ICredentialProviderCre
         return DefWindowProcW(hwnd,msg,w,l);
     }
     void Poll() {
-        if (ready) { if (GetTickCount64()>ticket.expires || !EmptyConsole(session)) Clear(); return; }
-        if (!events || !EmptyConsole(session)) return;
+        if (ready) { if (GetTickCount64()>ticket.expires || !EligibleConsole(session)) Clear(); return; }
+        if (!events || !EligibleConsole(session)) return;
         WCHAR name[128]; swprintf_s(name,L"\\\\.\\pipe\\Pow3rTool-RCON-recovery-v1-%lu",session);
         HANDLE pipe=CreateFileW(name,GENERIC_READ,0,nullptr,OPEN_EXISTING,FILE_FLAG_OVERLAPPED|SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION,nullptr);
         if (pipe==INVALID_HANDLE_VALUE) return;
@@ -90,7 +110,7 @@ class Provider final : public ICredentialProvider, public ICredentialProviderCre
         ULONGLONG now=GetTickCount64();
         if (!ok || bytes!=sizeof(ticket) || ticket.magic!=0x52434c31 || ticket.session!=session || ticket.expires<now || ticket.expires>now+11000
             || ticket.user[31]!=0 || ticket.domain[63]!=0 || ticket.password[32]!=0 || wcslen(ticket.password)!=32
-            || wcscmp(ticket.user,L"rcon-operator")!=0 || !EmptyConsole(session)) { Clear(); return; }
+            || wcscmp(ticket.user,L"rcon-operator")!=0 || !EligibleConsole(session)) { Clear(); return; }
         ready=true; Audit(L"ticket-accepted");
         // Runs on LogonUI's own apartment via its message loop, not an unmarshal'd
         // COM callback from a background thread.
@@ -107,7 +127,7 @@ public:
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
     ULONG STDMETHODCALLTYPE Release() override { LONG r=InterlockedDecrement(&refs); if (!r) delete this; return r; }
-    HRESULT STDMETHODCALLTYPE SetUsageScenario(CREDENTIAL_PROVIDER_USAGE_SCENARIO usage,DWORD) override { return usage==CPUS_LOGON ? S_OK : E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetUsageScenario(CREDENTIAL_PROVIDER_USAGE_SCENARIO usage,DWORD) override { if(usage!=CPUS_LOGON && usage!=CPUS_UNLOCK_WORKSTATION) return E_NOTIMPL; scenario=usage; return S_OK; }
     HRESULT STDMETHODCALLTYPE SetSerialization(const CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE Advise(ICredentialProviderEvents* e,UINT_PTR context) override {
         Audit(L"provider-advised"); UnAdvise(); events=e; events->AddRef(); adviseContext=context;
@@ -129,7 +149,7 @@ public:
         HRESULT hr=SHStrDupW(L"RCON recovery",&d->pszLabel); if (FAILED(hr)) { CoTaskMemFree(d); return hr; } *out=d; return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetCredentialCount(DWORD* count,DWORD* def,BOOL* autologon) override {
-        if (ready && (GetTickCount64()>ticket.expires || !EmptyConsole(session))) Clear();
+        if (ready && (GetTickCount64()>ticket.expires || !EligibleConsole(session))) Clear();
         *count=ready ? 1 : 0; *def=ready ? 0 : CREDENTIAL_PROVIDER_NO_DEFAULT; *autologon=ready; return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetCredentialAt(DWORD i,ICredentialProviderCredential** out) override {
@@ -151,7 +171,7 @@ public:
     HRESULT STDMETHODCALLTYPE CommandLinkClicked(DWORD) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetSerialization(CREDENTIAL_PROVIDER_GET_SERIALIZATION_RESPONSE* response,CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION* serial,PWSTR* text,CREDENTIAL_PROVIDER_STATUS_ICON* icon) override {
         Audit(L"serialization-requested"); *response=CPGSR_NO_CREDENTIAL_NOT_FINISHED; ZeroMemory(serial,sizeof(*serial)); *text=nullptr; *icon=CPSI_NONE;
-        if (!ready || GetTickCount64()>ticket.expires || !EmptyConsole(session)) { Clear(); return S_OK; }
+        if (!ready || GetTickCount64()>ticket.expires || !EligibleConsole(session)) { Clear(); return S_OK; }
         LSA_HANDLE lsa=nullptr; NTSTATUS status=LsaConnectUntrusted(&lsa);
         if (status) { Clear(); return HRESULT_FROM_WIN32(LsaNtStatusToWinError(status)); }
         char package[]="Negotiate"; LSA_STRING name={9,10,package}; ULONG auth=0;
@@ -159,7 +179,7 @@ public:
         if (status) { Clear(); return HRESULT_FROM_WIN32(LsaNtStatusToWinError(status)); }
         DWORD size=sizeof(KERB_INTERACTIVE_UNLOCK_LOGON)+static_cast<DWORD>((wcslen(ticket.domain)+wcslen(ticket.user)+wcslen(ticket.password))*sizeof(WCHAR));
         auto raw=static_cast<BYTE*>(CoTaskMemAlloc(size)); if(!raw) { Clear(); return E_OUTOFMEMORY; } ZeroMemory(raw,size);
-        auto logon=reinterpret_cast<KERB_INTERACTIVE_UNLOCK_LOGON*>(raw); logon->Logon.MessageType=KerbInteractiveLogon;
+        auto logon=reinterpret_cast<KERB_INTERACTIVE_UNLOCK_LOGON*>(raw); logon->Logon.MessageType=scenario==CPUS_UNLOCK_WORKSTATION ? KerbWorkstationUnlockLogon : KerbInteractiveLogon;
         DWORD offset=sizeof(*logon);
         auto pack=[&](UNICODE_STRING& dest,const WCHAR* source) { dest.Length=dest.MaximumLength=static_cast<USHORT>(wcslen(source)*sizeof(WCHAR)); CopyMemory(raw+offset,source,dest.Length); dest.Buffer=reinterpret_cast<PWSTR>(static_cast<ULONG_PTR>(offset)); offset+=dest.Length; };
         pack(logon->Logon.LogonDomainName,ticket.domain); pack(logon->Logon.UserName,ticket.user); pack(logon->Logon.Password,ticket.password);

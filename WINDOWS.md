@@ -501,9 +501,12 @@ sign-in providers remain installed. After upgrading an enabled node, run
 using recovery. Rollback: `recovery-disable` disables the account and unregisters
 the provider while retaining the profile and ownership metadata.
 
-`desktop_recover(node)` explicitly requests a console sign-in after boot. It
-refuses any existing human session, including disconnected sessions. An active
+`desktop_recover(node)` explicitly requests a console sign-in after boot or an
+unlock of the existing locked recovery console. It
+refuses any existing human session, including disconnected sessions. An unlocked active
 recovery console session is reused; no password change occurs in that case.
+A locked recovery console receives a fresh transient credential; the service
+verifies the same logon identity remains and Windows reports the session unlocked.
 Once Windows' provider connects, the SYSTEM service generates a fresh random
 32-character password, updates only its owned local account, and passes the
 credential over a SYSTEM-only local pipe. Both sides verify the peer process.
@@ -519,7 +522,7 @@ password resets mean saved DPAPI credentials in this dedicated profile are
 disposable. Do not use it as a human's account or store durable saved sign-ins.
 Use `desktop_observe` to wait for the new desktop, then `desktop_launch` to start
 an application as that standard user. SYSTEM remote_run remains the administrative
-path. This is not a human-session unlock or UAC-clicking feature.
+path. This does not unlock human sessions or answer UAC prompts.
 
 RCON audit events in `C:\RCON\logs\desktop-pause.jsonl` record enable/disable, lock and sign-in request/completion/failure metadata. `C:\RCON\state\recovery-provider.log` contains bounded UTF-16 provider
 stage/status diagnostics, never passwords. Normal desktop pause rules still apply.
@@ -530,9 +533,9 @@ request it. Existing profile first-run dialogs may require normal GUI handling.
 `desktop_lock(node, session_id)` calls native `LockWorkStation` in the selected
 logged-on session, then verifies WTS reports it locked. Apps keep running.
 It respects the human pause and active interaction guards; release held input
-first. Locking an already locked session is idempotent. The first recovery
-implementation cannot unlock an existing recovery session; it refuses instead
-of rotating a password or falsely reporting that the desktop is usable. A human
-can sign into their own account, or a later recovery can run after a clean reboot.
+first. Locking an already locked session is idempotent. Call `desktop_recover` to resume the locked RCON-owned console without ending its
+apps. It rotates only that dedicated account's password and disables it again
+afterward. Human sessions always block recovery. A human can sign into their own
+account normally.
 Lock verification uses the Windows 10+ WTSINFOEX session flags:
 https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/ns-wtsapi32-wtsinfoex_level1_w

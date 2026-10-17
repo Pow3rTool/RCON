@@ -286,18 +286,25 @@ func recoverDesktop(c desktopCommand) (result map[string]any) {
 		out["sessions"] = all
 		return out
 	}
+	unlocking := false
+	startingLogonID := ""
 	if existing != nil {
+		if !existing.Console || existing.State != "active" {
+			return fail(errors.New("recovery user already has a non-console session; inspect or attach it first"))
+		}
 		locked, e := desktopSessionLocked(existing.ID)
 		if e != nil {
 			return fail(e)
 		}
-		if locked {
-			return fail(errors.New("recovery session is locked; this first-pass recovery supports empty-console sign-in, not unlocking an existing session"))
+		if !locked {
+			return map[string]any{"ok": true, "id": c.ID, "session_id": existing.ID, "user": own, "reused": true, "password_retained": false}
 		}
-		if !existing.Console || existing.State != "active" {
-			return fail(errors.New("recovery user already has a session; use desktop_attach_console or inspect its lock state"))
+		live, e := recoveryLiveSession(existing.ID, own)
+		if e != nil {
+			return fail(e)
 		}
-		return map[string]any{"ok": true, "id": c.ID, "session_id": existing.ID, "user": own, "reused": true, "password_retained": false}
+		startingLogonID = live.LogonID
+		unlocking = true
 	}
 	console := windows.WTSGetActiveConsoleSessionId()
 	if console == 0 || console == 0xffffffff {
@@ -325,8 +332,25 @@ func recoverDesktop(c desktopCommand) (result map[string]any) {
 	if err != nil {
 		return fail(err)
 	}
-	if len(all) != 0 {
+	current, e := recoverySessionDecision(all, own)
+	if e != nil {
+		return fail(e)
+	}
+	if !unlocking && current != nil {
 		return fail(errors.New("a user signed in while recovery was pending; no password changed"))
+	}
+	if unlocking {
+		if current == nil || current.ID != console || !current.Console || current.State != "active" {
+			return fail(errors.New("recovery session changed while unlock was pending"))
+		}
+		live, e := recoveryLiveSession(console, own)
+		if e != nil || live.LogonID != startingLogonID {
+			return fail(errors.New("recovery logon changed while unlock was pending"))
+		}
+		locked, e := desktopSessionLocked(console)
+		if e != nil || !locked {
+			return fail(errors.New("recovery session is no longer locked; no password changed"))
+		}
 	}
 	if pause, err := readDesktopPause(); err != nil || pause != nil {
 		return fail(errors.New("desktop is paused; recovery cancelled"))
@@ -375,12 +399,23 @@ func recoverDesktop(c desktopCommand) (result map[string]any) {
 	clear(p)
 	conn.Close()
 	listener.Close()
-	desktopEvent("recovery-signin-requested", map[string]any{"request_id": c.ID, "session_id": console, "account": cfg.User})
+	desktopEvent("recovery-signin-requested", map[string]any{"request_id": c.ID, "session_id": console, "account": cfg.User, "unlock": unlocking})
 	for ctx.Err() == nil {
 		sessions, err := desktopSessions()
 		if err == nil {
 			for _, s := range sessions {
 				if strings.EqualFold(s.User, own) && s.ID == console {
+					locked, e := desktopSessionLocked(s.ID)
+					if e != nil || locked {
+						continue
+					}
+					if unlocking && s.LogonID != startingLogonID {
+						return desktopFailure(c.ID, "unknown", errors.New("logon identity changed during unlock; inspect the session"))
+					}
+					if unlocking {
+						desktopEvent("recovery-unlock-complete", map[string]any{"request_id": c.ID, "session_id": s.ID, "account": cfg.User})
+						return map[string]any{"ok": true, "id": c.ID, "session_id": s.ID, "user": own, "unlocked": true, "session_preserved": true, "password_retained": false, "next": "Observe the resumed desktop before sending input"}
+					}
 					desktopEvent("recovery-signin-complete", map[string]any{"request_id": c.ID, "session_id": s.ID, "account": cfg.User})
 					return map[string]any{"ok": true, "id": c.ID, "session_id": s.ID, "user": own, "created": true, "desktop_state": "session_created", "password_retained": false, "next": "Use desktop_observe, then desktop_launch once the desktop is ready"}
 				}
@@ -443,4 +478,19 @@ func disableDesktopRecovery() error {
 	// Retain ownership metadata and the profile so re-enabling is safe.
 	desktopEvent("recovery-disabled", map[string]any{"account": desktopRecoveryUser})
 	return nil
+}
+
+func recoveryLiveSession(id uint32, own string) (desktopSession, error) {
+	all, err := desktopSessions()
+	if err != nil {
+		return desktopSession{}, err
+	}
+	s, err := selectDesktopSession(all, id)
+	if err != nil {
+		return s, err
+	}
+	if !strings.EqualFold(s.User, own) {
+		return desktopSession{}, errors.New("recovery session user changed")
+	}
+	return s, nil
 }
