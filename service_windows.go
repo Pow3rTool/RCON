@@ -79,6 +79,25 @@ func platformCommand(args []string) bool {
 		return false
 	}
 	switch args[0] {
+	case "recovery-disable":
+		if len(args) != 1 {
+			log.Fatal("usage: rcon.exe recovery-disable")
+		}
+		if err := disableDesktopRecovery(); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("Recovery disabled; account and profile retained")
+		return true
+	case "recovery-enable":
+		if len(args) != 1 {
+			log.Fatal("usage: rcon.exe recovery-enable")
+		}
+		cfg, err := enableDesktopRecovery()
+		if err != nil {
+			log.Fatal(err)
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(cfg)
+		return true
 	case "desktop-worker":
 		if err := runDesktopWorker(args[1:]); err != nil {
 			log.Fatal(err)
@@ -236,6 +255,7 @@ func (s *rconWindowsService) Execute(args []string, requests <-chan svc.ChangeRe
 	defer f.Close()
 	log.SetOutput(f)
 	s.cfg = cfg
+	reconcileDesktopRecovery()
 	stopDesktopSafety := startDesktopSafetySupervisor()
 	defer stopDesktopSafety()
 	armPendingUpgrade() // watchdog or settling for an upgrade in flight at startup

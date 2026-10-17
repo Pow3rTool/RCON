@@ -15,6 +15,7 @@ prebuilt binaries by design (smaller attack surface).
 - **Go 1.26+** (matches `go.mod`). Install from go.dev; e.g.
   `curl -LO https://go.dev/dl/go1.26.8.linux-amd64.tar.gz && sudo tar -C /usr/local -xzf go*.tar.gz`
   → `go` at `/usr/local/go/bin/go`.
+- Windows/amd64 releases also require MinGW-w64 C++ (`g++-mingw-w64-x86-64-posix` on Ubuntu). `build.sh` builds and embeds the opt-in native recovery provider; the target needs no compiler or additional runtime DLLs. Set `RCON_MINGW_CXX` to override the compiler.
 - The RCON source mounted (or a clone).
 - `release-pubkey.txt` present in `RCON/` (your Ed25519 **release public key**).
   Export it from your own control plane:

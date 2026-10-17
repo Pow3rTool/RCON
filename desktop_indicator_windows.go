@@ -404,7 +404,7 @@ func runDesktopIndicator(conn net.Conn, request desktopWorkerRequest) (result er
 	if p := desktopUser32.NewProc("SetProcessDpiAwarenessContext"); p.Find() == nil {
 		p.Call(^uintptr(3))
 	}
-	if _, err := desktopState(request.Session); err != nil {
+	if _, err := desktopIndicatorState(request.Session); err != nil {
 		return err
 	}
 	unregister, err := registerIndicatorClass()
@@ -458,7 +458,7 @@ func runDesktopIndicator(conn net.Conn, request desktopWorkerRequest) (result er
 				return errors.New("invalid indicator update")
 			}
 			// Revalidate the session before acknowledging visibility for another action.
-			if _, err := desktopState(request.Session); err != nil {
+			if _, err := desktopIndicatorState(request.Session); err != nil {
 				return err
 			}
 			if message.Label == "AI viewing" || message.Label == "AI controlling" || message.Label == "AI thinking" {
@@ -515,7 +515,7 @@ func runDesktopIndicator(conn net.Conn, request desktopWorkerRequest) (result er
 			}
 			indicatorPointerTick()
 			if now.Sub(checked) >= 500*time.Millisecond {
-				if _, err := desktopState(request.Session); err != nil {
+				if _, err := desktopIndicatorState(request.Session); err != nil {
 					return err
 				}
 				current, err := getIndicatorMonitors()
@@ -556,4 +556,15 @@ func registerIndicatorClass() (func(), error) {
 		}
 		desktopUser("UnregisterClassW", uintptr(unsafe.Pointer(&class[0])), 0)
 	}, nil
+}
+
+// An empty local console (for example just after first-profile setup) can have
+// no foreground window. The overlay may still render so desktop_launch can open
+// an app. Capture and input keep their strict foreground guard. RDP remains strict.
+func desktopIndicatorState(session desktopSession) (desktopGuard, error) {
+	g, err := desktopState(session)
+	if errors.Is(err, errDesktopNoForeground) && strings.EqualFold(session.Station, "Console") && windows.WTSGetActiveConsoleSessionId() == session.ID {
+		return g, nil
+	}
+	return g, err
 }

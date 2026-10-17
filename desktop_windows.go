@@ -175,6 +175,9 @@ func nativeDesktop(c desktopCommand) (result map[string]any) {
 			return fail(errors.New("desktop interaction active; continue or release it before other gestures"))
 		}
 	}
+	if c.Op == "recover" {
+		return recoverDesktop(c)
+	}
 	if c.Op == "attach_console" {
 		note, failure := attachDesktopConsole(c)
 		if failure != nil {
@@ -197,6 +200,14 @@ func nativeDesktop(c desktopCommand) (result map[string]any) {
 	selected = session.ID
 	if err := ensureDesktopSafety(session); err != nil {
 		return fail(err)
+	}
+	if c.Op == "lock" {
+		delete(desktopManager.frames, session.ID)
+		response, err := callDesktopWorker(desktopWorkerRequest{Command: c, Session: session})
+		if err != nil {
+			return desktopFailure(c.ID, "unknown", err)
+		}
+		return response.Result
 	}
 	if c.Op == "launch" {
 		// A started program appears on the user's desktop, so the indicator shows;

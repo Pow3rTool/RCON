@@ -297,6 +297,9 @@ func desktopSnapshotMode(session desktopSession, interaction bool) (desktopWorke
 }
 func performDesktopOperation(req desktopWorkerRequest) desktopWorkerResponse {
 	c := req.Command
+	if c.Op == "lock" {
+		return performDesktopLock(req)
+	}
 	status := "not_sent"
 	fail := func(err error) desktopWorkerResponse {
 		out := desktopFailure(c.ID, status, err)

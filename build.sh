@@ -37,7 +37,12 @@ for plat in "${PLATFORMS[@]}"; do
     linux) ;;
     *) echo "FATAL: unsupported OS: $os (supported: linux, windows)" >&2; exit 1 ;;
   esac
-  CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" "$GO" build \
+  RCON_TAGS=()
+  if [ "$plat" = "windows/amd64" ]; then
+    bash "$HERE/windows/recovery/build.sh"
+    RCON_TAGS=(-tags recoveryprovider)
+  fi
+  CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" "$GO" build "${RCON_TAGS[@]}" \
     -trimpath -ldflags "-s -w -X main.version=$VERSION -X main.releasePubKeyB64=$PUBKEY" \
     -o "$out" "$HERE"
 

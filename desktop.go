@@ -119,6 +119,14 @@ func validateDesktopCommand(c desktopCommand) error {
 		return errors.New("launch requires its launch fields and nothing else does")
 	}
 	switch c.Op {
+	case "lock":
+		if c.FrameID != "" || c.WaitMS != 0 || c.DesktopAction != (DesktopAction{}) {
+			return errors.New("lock takes only an optional session_id")
+		}
+	case "recover":
+		if c.SessionID != 0 || c.FrameID != "" || c.WaitMS != 0 || c.DesktopAction != (DesktopAction{}) {
+			return errors.New("recover takes no session, frame or input; it only signs in the configured recovery account when nobody is logged on")
+		}
 	case "wait":
 		if c.FrameID != "" || c.Action != "wait" {
 			return errors.New("wait takes a wait action and no frame")

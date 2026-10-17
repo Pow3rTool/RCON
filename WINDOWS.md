@@ -488,3 +488,51 @@ a temporary inert canvas, sends test input only onto that canvas, verifies tagge
 input tracking/click-through/held state/pause cleanup and capture exclusion, saves
 preview evidence, and restores the original pointer position. It requires a
 rendered logged-on desktop and is not part of unattended regression tests.
+
+
+## Opt-in console recovery
+
+Run the installed executable's `recovery-enable` command as LocalSystem (for
+example via RCON remote_run). It provisions `rcon-operator` as a disabled standard
+local user, records its SID, and registers RCON's native Windows Credential
+Provider. It refuses to adopt an existing unowned account. Windows' built-in
+sign-in providers remain installed. After upgrading an enabled node, run
+`recovery-enable` again to register the new bundled provider, then reboot before
+using recovery. Rollback: `recovery-disable` disables the account and unregisters
+the provider while retaining the profile and ownership metadata.
+
+`desktop_recover(node)` explicitly requests a console sign-in after boot. It
+refuses any existing human session, including disconnected sessions. An active
+recovery console session is reused; no password change occurs in that case.
+Once Windows' provider connects, the SYSTEM service generates a fresh random
+32-character password, updates only its owned local account, and passes the
+credential over a SYSTEM-only local pipe. Both sides verify the peer process.
+The credential has a ten-second handoff lifetime; the request has a 35-second
+deadline. RCON clears its credential buffers and disables the account after the
+attempt, including after successful sign-in; that does not end the created
+session. Service startup disables it again after an interrupted attempt.
+
+No password is put in arguments, tool results, logs, environment or an autologon
+registry value. Windows necessarily retains the account's SAM password verifier;
+Windows authentication also handles the credential in memory. Administrative
+password resets mean saved DPAPI credentials in this dedicated profile are
+disposable. Do not use it as a human's account or store durable saved sign-ins.
+Use `desktop_observe` to wait for the new desktop, then `desktop_launch` to start
+an application as that standard user. SYSTEM remote_run remains the administrative
+path. This is not a human-session unlock or UAC-clicking feature.
+
+RCON audit events in `C:\RCON\logs\desktop-pause.jsonl` record enable/disable, lock and sign-in request/completion/failure metadata. `C:\RCON\state\recovery-provider.log` contains bounded UTF-16 provider
+stage/status diagnostics, never passwords. Normal desktop pause rules still apply.
+Recovery is explicit, not automatic at every boot; an alert-handling agent must
+request it. Existing profile first-run dialogs may require normal GUI handling.
+
+
+`desktop_lock(node, session_id)` calls native `LockWorkStation` in the selected
+logged-on session, then verifies WTS reports it locked. Apps keep running.
+It respects the human pause and active interaction guards; release held input
+first. Locking an already locked session is idempotent. The first recovery
+implementation cannot unlock an existing recovery session; it refuses instead
+of rotating a password or falsely reporting that the desktop is usable. A human
+can sign into their own account, or a later recovery can run after a clean reboot.
+Lock verification uses the Windows 10+ WTSINFOEX session flags:
+https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/ns-wtsapi32-wtsinfoex_level1_w
