@@ -298,6 +298,22 @@ key-state synchronization can advance it without a meaningful action. Input cons
 dispatch, including uncertain outcomes; changed or consumed frames require a new
 observation. Screenshots and typed text are omitted from node audit records.
 
+The frame guard proves only that focus did not move since the frame. A gesture
+may also carry `expect_foreground` (`class`, exact; `title`, substring; both
+case-insensitive), checked against the live foreground immediately before
+SendInput. A mismatch is refused with `input_status: not_sent`; the error names
+the window class but not its title, which stays out of the node log. Use it for
+keys or text that follow a window-opening step (WIN+R → class `#32770`, title
+`Run`), where the previous step's result becomes the next frame's baseline.
+Nodes that support it report `foreground_expectation=true`.
+
+Keyboard events carry the scan code a physical keyboard would send (mapped
+through the foreground thread's layout), not only the virtual key; apps that
+identify keys physically, such as winit-based UIs, ignore scan code 0. Nodes
+report `key_scan_codes=true`. The window list omits DWM-cloaked windows (hidden
+Store apps such as Settings or the Text Input Application), and minimized windows
+are listed by identity only, without their off-screen rectangles.
+
 An existing unlocked and rendered Windows desktop is required. This capability
 does not log in, unlock, accept UAC prompts, or reconnect/transfer RDP sessions.
 An RDP session can report Active while its display is unusable; restore its viewer

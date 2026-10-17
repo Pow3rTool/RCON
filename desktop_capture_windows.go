@@ -175,14 +175,30 @@ func imageDesktopRect(r desktopRect, g desktopGuard) [4]int {
 	sy := float64(g.Height) / float64(g.Bounds.Height)
 	return [4]int{int(math.Round((float64(r.Left) - float64(g.Bounds.X)) * sx)), int(math.Round((float64(r.Top) - float64(g.Bounds.Y)) * sy)), int(math.Round((float64(r.Right) - float64(g.Bounds.X)) * sx)), int(math.Round((float64(r.Bottom) - float64(g.Bounds.Y)) * sy))}
 }
-func desktopWindow(hwnd uintptr, g desktopGuard) map[string]any {
+func desktopWindowIdentity(hwnd uintptr) (string, string, uint32) {
 	var title [512]uint16
 	var class [256]uint16
 	var pid uint32
-	var rect, client, visible desktopRect
 	desktopUser("GetWindowTextW", hwnd, uintptr(unsafe.Pointer(&title[0])), uintptr(len(title)))
 	desktopUser("GetClassNameW", hwnd, uintptr(unsafe.Pointer(&class[0])), uintptr(len(class)))
 	desktopUser("GetWindowThreadProcessId", hwnd, uintptr(unsafe.Pointer(&pid)))
+	return windows.UTF16ToString(title[:]), windows.UTF16ToString(class[:]), pid
+}
+
+// Suspended or hidden Store-style windows (Settings, Text Input Application)
+// stay "visible" to user32 while DWM cloaks them; they are not on screen.
+func desktopCloaked(hwnd uintptr) bool {
+	p := desktopDWM.NewProc("DwmGetWindowAttribute")
+	if p.Find() != nil {
+		return false
+	}
+	var cloaked uint32
+	r, _, _ := p.Call(hwnd, 14, uintptr(unsafe.Pointer(&cloaked)), unsafe.Sizeof(cloaked)) // DWMWA_CLOAKED
+	return r == 0 && cloaked != 0
+}
+func desktopWindow(hwnd uintptr, g desktopGuard) map[string]any {
+	title, class, pid := desktopWindowIdentity(hwnd)
+	var rect, client, visible desktopRect
 	desktopUser("GetWindowRect", hwnd, uintptr(unsafe.Pointer(&rect)))
 	desktopUser("GetClientRect", hwnd, uintptr(unsafe.Pointer(&client)))
 	desktopUser("MapWindowPoints", hwnd, 0, uintptr(unsafe.Pointer(&client)), 2)
@@ -194,16 +210,19 @@ func desktopWindow(hwnd uintptr, g desktopGuard) map[string]any {
 	if p := desktopUser32.NewProc("GetDpiForWindow"); p.Find() == nil {
 		dpi, _, _ = p.Call(hwnd)
 	}
-	return map[string]any{"hwnd": fmt.Sprintf("0x%x", hwnd), "pid": pid, "title": windows.UTF16ToString(title[:]), "class": windows.UTF16ToString(class[:]), "dpi": dpi, "minimized": desktopUser("IsIconic", hwnd) != 0, "maximized": desktopUser("IsZoomed", hwnd) != 0, "rect": imageDesktopRect(rect, g), "client_rect": imageDesktopRect(client, g), "visible_rect": imageDesktopRect(visible, g)}
+	return map[string]any{"hwnd": fmt.Sprintf("0x%x", hwnd), "pid": pid, "title": title, "class": class, "dpi": dpi, "minimized": desktopUser("IsIconic", hwnd) != 0, "maximized": desktopUser("IsZoomed", hwnd) != 0, "rect": imageDesktopRect(rect, g), "client_rect": imageDesktopRect(client, g), "visible_rect": imageDesktopRect(visible, g)}
 }
 func desktopWindows(g desktopGuard) []map[string]any {
 	result := []map[string]any{}
 	// GetTopWindow/GetWindow avoids allocating a new Go syscall callback on each capture.
 	h := desktopUser("GetTopWindow", 0)
 	for n := 0; h != 0 && n < 1000 && len(result) < 40; n++ {
-		if desktopUser("IsWindowVisible", h) != 0 && desktopUser("GetWindowTextLengthW", h) > 0 {
-			window := desktopWindow(h, g)
-			if window["class"] != desktopIndicatorClass {
+		if desktopUser("IsWindowVisible", h) != 0 && desktopUser("GetWindowTextLengthW", h) > 0 && !desktopCloaked(h) {
+			if desktopUser("IsIconic", h) != 0 {
+				// Minimized windows sit at -32000; their rects only mislead.
+				title, class, pid := desktopWindowIdentity(h)
+				result = append(result, map[string]any{"hwnd": fmt.Sprintf("0x%x", h), "pid": pid, "title": title, "class": class, "minimized": true})
+			} else if window := desktopWindow(h, g); window["class"] != desktopIndicatorClass {
 				result = append(result, window)
 			}
 		}
@@ -256,7 +275,7 @@ func desktopSnapshotMode(session desktopSession, interaction bool) (desktopWorke
 	after.FrameID = desktopID()
 	after.Created = time.Now().UTC()
 	hash := sha256.Sum256(data)
-	obs := map[string]any{"frame_id": after.FrameID, "actionable": actionable, "captured_at": after.Created, "session_id": session.ID, "session_user": session.User, "session_station": session.Station, "image_width": after.Width, "image_height": after.Height, "sha256": hex.EncodeToString(hash[:]), "last_input_tick": after.InputTick, "desktop_rect": map[string]int{"x": after.Bounds.X, "y": after.Bounds.Y, "width": after.Bounds.Width, "height": after.Bounds.Height}, "windows": windowsList, "cursor": cursor, "pressed_virtual_keys": desktopPressed(), "foreground": desktopWindow(uintptr(after.Foreground), after), "capabilities": map[string]any{"worker_version": "rcon-native-1", "transport": "native", "key_grammar": "chord-v1", "actions": []string{"click", "double_click", "move", "scroll", "drag", "key", "type"}, "buttons": []string{"left", "right", "middle"}, "wheel_axes": []string{"vertical", "horizontal"}, "cross_call_held_input": true, "interaction_protocol": "held-v1", "interruption_policy": "external-escape-triple", "pause_escape_count": 3, "pause_escape_window_ms": 1500, "pause_scope": "logged-on-session-including-idle", "resume_policy": "local-badge-click", "input_timestamp_policy": "diagnostic-only", "interaction_max_lease_ms": 60000, "interaction_max_frames": 6, "window_geometry": true, "cursor_metadata": true, "session_selection": true, "visual_indicator": true, "visual_pointer": "tagged-v1"}}
+	obs := map[string]any{"frame_id": after.FrameID, "actionable": actionable, "captured_at": after.Created, "session_id": session.ID, "session_user": session.User, "session_station": session.Station, "image_width": after.Width, "image_height": after.Height, "sha256": hex.EncodeToString(hash[:]), "last_input_tick": after.InputTick, "desktop_rect": map[string]int{"x": after.Bounds.X, "y": after.Bounds.Y, "width": after.Bounds.Width, "height": after.Bounds.Height}, "windows": windowsList, "cursor": cursor, "pressed_virtual_keys": desktopPressed(), "foreground": desktopWindow(uintptr(after.Foreground), after), "capabilities": map[string]any{"worker_version": "rcon-native-1", "transport": "native", "key_grammar": "chord-v1", "actions": []string{"click", "double_click", "move", "scroll", "drag", "key", "type"}, "buttons": []string{"left", "right", "middle"}, "wheel_axes": []string{"vertical", "horizontal"}, "cross_call_held_input": true, "interaction_protocol": "held-v1", "interruption_policy": "external-escape-triple", "pause_escape_count": 3, "pause_escape_window_ms": 1500, "pause_scope": "logged-on-session-including-idle", "resume_policy": "local-badge-click", "input_timestamp_policy": "diagnostic-only", "interaction_max_lease_ms": 60000, "interaction_max_frames": 6, "window_geometry": true, "cursor_metadata": true, "session_selection": true, "visual_indicator": true, "visual_pointer": "tagged-v1", "foreground_expectation": true, "key_scan_codes": true}}
 	result.Result = map[string]any{"ok": true, "observation": obs, "image": map[string]any{"mimeType": "image/jpeg", "data": base64.StdEncoding.EncodeToString(data)}}
 	pause, pauseErr := readDesktopPause()
 	obs["control_paused"] = pause != nil || pauseErr != nil
@@ -312,6 +331,12 @@ func performDesktopOperation(req desktopWorkerRequest) desktopWorkerResponse {
 		}
 		if err = validateDesktopGuard(c, req.Previous, live); err != nil {
 			return fail(err)
+		}
+		if c.ExpectForeground != nil {
+			title, class, _ := desktopWindowIdentity(uintptr(live.Foreground))
+			if err = matchDesktopForeground(c.ExpectForeground, class, title); err != nil {
+				return fail(err)
+			}
 		}
 		if len(desktopPressed()) != 0 {
 			return fail(errors.New("physical key or button held; release input and observe again"))

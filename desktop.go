@@ -29,6 +29,16 @@ type DesktopAction struct {
 	DurationMS int    `json:"duration_ms,omitempty"`
 	Key        string `json:"key,omitempty"`
 	Text       string `json:"text,omitempty"`
+	// Optional intent guard, checked against the live foreground just before input.
+	ExpectForeground *DesktopWindowMatch `json:"expect_foreground,omitempty"`
+}
+
+// The frame guard only proves the foreground did not change since the frame.
+// This names the window the caller means to reach (for example the Run dialog
+// after WIN+R), so keys and text never land in whatever else took focus.
+type DesktopWindowMatch struct {
+	Class string `json:"class,omitempty"` // exact window class, case-insensitive
+	Title string `json:"title,omitempty"` // case-insensitive substring of the title
 }
 
 type desktopCommand struct {
@@ -129,6 +139,18 @@ func validateDesktopGuard(c desktopCommand, old, live desktopGuard) error {
 	}
 	return nil
 }
+
+// The error names the class but not the title: titles are application content
+// and stay out of the node's desktop log.
+func matchDesktopForeground(m *DesktopWindowMatch, class, title string) error {
+	if m == nil {
+		return nil
+	}
+	if (m.Class == "" || strings.EqualFold(m.Class, class)) && (m.Title == "" || strings.Contains(strings.ToLower(title), strings.ToLower(m.Title))) {
+		return nil
+	}
+	return fmt.Errorf("foreground window (class %q) does not match expect_foreground; input not sent, observe again", class)
+}
 func desktopFailure(id, status string, err error) map[string]any {
 	return map[string]any{"id": id, "ok": false, "input_status": status, "error": err.Error()}
 }
@@ -212,6 +234,14 @@ func validateDesktopAction(a DesktopAction) error {
 	}
 	if a.Action != "scroll" && (a.Axis != "" || a.Steps != 0) {
 		return errors.New("scroll fields require scroll")
+	}
+	if m := a.ExpectForeground; m != nil {
+		if m.Class == "" && m.Title == "" {
+			return errors.New("expect_foreground requires class and/or title")
+		}
+		if len(m.Class) > 256 || len(m.Title) > 512 {
+			return errors.New("expect_foreground class or title too long")
+		}
 	}
 	switch a.Action {
 	case "click", "double_click", "move":

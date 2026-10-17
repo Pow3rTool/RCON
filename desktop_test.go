@@ -58,3 +58,40 @@ func TestDesktopProtocolRejectsUnboundedOrAmbiguousInput(t *testing.T) {
 		}
 	}
 }
+func TestDesktopForegroundExpectation(t *testing.T) {
+	id := strings.Repeat("a", 32)
+	run := &DesktopWindowMatch{Class: "#32770", Title: "run"}
+	if err := matchDesktopForeground(run, "#32770", "Run"); err != nil {
+		t.Fatal(err)
+	}
+	if err := matchDesktopForeground(&DesktopWindowMatch{Title: "pcb editor"}, "wxWindowNR", "*a120fc-bridge — PCB Editor"); err != nil {
+		t.Fatal("title substring should match case-insensitively", err)
+	}
+	if err := matchDesktopForeground(nil, "anything", "at all"); err != nil {
+		t.Fatal("no expectation must not block input", err)
+	}
+	err := matchDesktopForeground(run, "StencilWindow", "secret-title")
+	if err == nil {
+		t.Fatal("typed into the wrong window")
+	}
+	if strings.Contains(err.Error(), "secret-title") || !strings.Contains(err.Error(), "StencilWindow") {
+		t.Fatal("refusal must name the class but keep the title out of the node log:", err)
+	}
+	if matchDesktopForeground(run, "#32770", "Save As") == nil {
+		t.Fatal("class match alone accepted a mismatched title")
+	}
+	key := func(m *DesktopWindowMatch) desktopCommand {
+		return desktopCommand{ID: id, Op: "act", SessionID: 2, FrameID: id, DesktopAction: DesktopAction{Action: "type", Text: "notepad", ExpectForeground: m}}
+	}
+	if err := validateDesktopCommand(key(run)); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []*DesktopWindowMatch{{}, {Class: strings.Repeat("c", 257)}, {Title: strings.Repeat("t", 513)}} {
+		if validateDesktopCommand(key(m)) == nil {
+			t.Fatalf("accepted expectation %+v", m)
+		}
+	}
+	if validateDesktopCommand(desktopCommand{ID: id, Op: "observe", DesktopAction: DesktopAction{ExpectForeground: run}}) == nil {
+		t.Fatal("observe accepted an input guard")
+	}
+}

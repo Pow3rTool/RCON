@@ -62,7 +62,25 @@ func desktopMove(x, y int, g desktopGuard) error {
 	dy := int32(float64(y) * float64(g.Bounds.Height) / float64(g.Height) * 65535 / float64(g.Bounds.Height-1))
 	return desktopMouse(0xC001, 0, dx, dy, false) // MOVE | ABSOLUTE | VIRTUALDESK
 }
+
+// A physical keyboard reports a scan code with every virtual key. Apps that
+// identify keys physically (winit/Rust UIs, games, some terminals) ignore a key
+// whose scan code is 0, so derive it from the foreground thread's layout.
+func desktopScan(vk uint16) (uint16, uint32) {
+	layout := desktopUser("GetKeyboardLayout", desktopUser("GetWindowThreadProcessId", desktopUser("GetForegroundWindow"), 0))
+	sc := desktopUser("MapVirtualKeyExW", uintptr(vk), 4, layout) // MAPVK_VK_TO_VSC_EX
+	flags := uint32(0)
+	if prefix := sc >> 8; prefix == 0xE0 || prefix == 0xE1 {
+		flags = 1 // KEYEVENTF_EXTENDEDKEY
+	}
+	return uint16(sc & 0xFF), flags
+}
 func desktopKey(vk, scan uint16, flags uint32, release bool) error {
+	if vk != 0 && scan == 0 && flags&4 == 0 { // not KEYEVENTF_UNICODE text
+		var extended uint32
+		scan, extended = desktopScan(vk)
+		flags |= extended
+	}
 	i := desktopInput{Type: 1}
 	k := (*desktopKeyboardInput)(unsafe.Pointer(&i.Data))
 	*k = desktopKeyboardInput{VK: vk, Scan: scan, Flags: flags, Extra: desktopInputTag}

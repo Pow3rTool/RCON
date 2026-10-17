@@ -12,8 +12,9 @@ listens directly, pre-broker).
 ## Tool surface
 `run` · `jobs` · `read` · `edit` · `write` (+ `stream`/`tail`, and
 `list_remote_hosts`/`whoami` on the Caller/MCP side).
-Live in Go today: **`run`** (one-shot, bounded) and **`jobs`** (long-running,
-reattachable). `read`/`edit`/`write` return `501` — spec is `reference/`.
+All live in Go: **`run`** (one-shot, bounded), **`jobs`** (long-running,
+reattachable) and hash-guarded **`read`**/**`edit`**/**`write`**. Windows nodes
+also serve **`desktop`** (screenshots and input; see [WINDOWS.md](WINDOWS.md)).
 
 ## Safety contracts
 - **read-before-edit hash guard** — edit/write require the hash from a prior read; rejected if the file changed since (optimistic concurrency, safe across concurrent agents/humans)
@@ -45,10 +46,9 @@ cross-compiles** — `linux/amd64` and `linux/arm64` verified
 (`CGO_ENABLED=0 GOOS=… GOARCH=… go build`). Proven end-to-end: the full turnstone
 → OBO → XConnect → RCON chain executes here.
 
-**Next:** `read`/`edit`/`write` (read-before-write hash guard) to the
-`reference/exec_daemon.py` contract, with `smoke_test.py` as the conformance
-suite; then the **fleet bootstrap** (`rcon enroll` self-registration + poll-for-
-approval) and **signed self-update**. See [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
+The file verbs, the **fleet bootstrap** (`rcon enroll` self-registration +
+poll-for-approval) and **signed self-update** (BUILD.md) have since shipped. See
+[`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 
 ## `reference/` — Python spec, **NOT deployed**
 > ⚠️ **Spec only. Do not wire these into a live config.** (`remote_shell_mcp.py`
