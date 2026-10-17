@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -93,5 +94,39 @@ func TestDesktopForegroundExpectation(t *testing.T) {
 	}
 	if validateDesktopCommand(desktopCommand{ID: id, Op: "observe", DesktopAction: DesktopAction{ExpectForeground: run}}) == nil {
 		t.Fatal("observe accepted an input guard")
+	}
+}
+func TestDesktopSettleRidesOutActivation(t *testing.T) {
+	g := desktopGuard{Foreground: 0x10}
+	// Taskbar restore: old window, a gap with no foreground, then the restored one.
+	sequence := []uint64{0x10, 0x10, 0, 0, 0x20}
+	calls := 0
+	state := func() (desktopGuard, error) {
+		live := g
+		if calls < len(sequence) {
+			live.Foreground = sequence[calls]
+		} else {
+			live.Foreground = 0x20
+		}
+		calls++
+		if live.Foreground == 0 {
+			return live, errDesktopNoForeground
+		}
+		return live, nil
+	}
+	if err := waitDesktopSettled(state, time.Millisecond, 20*time.Millisecond, 2*time.Second); err != nil {
+		t.Fatal("transient activation gap failed a sent gesture:", err)
+	}
+	if calls <= len(sequence) {
+		t.Fatal("returned before the restored window settled", calls)
+	}
+	broken := errors.New("active logon session changed")
+	if err := waitDesktopSettled(func() (desktopGuard, error) { return g, broken }, time.Millisecond, 20*time.Millisecond, time.Second); err != broken {
+		t.Fatal("real failures must still surface", err)
+	}
+	stuck := func() (desktopGuard, error) { return desktopGuard{}, errDesktopNoForeground }
+	start := time.Now()
+	if err := waitDesktopSettled(stuck, time.Millisecond, 5*time.Millisecond, 50*time.Millisecond); err != nil || time.Since(start) < 50*time.Millisecond {
+		t.Fatal("a desktop with no foreground should wait out the limit and leave the verdict to the snapshot", err)
 	}
 }

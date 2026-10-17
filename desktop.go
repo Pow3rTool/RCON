@@ -151,6 +151,37 @@ func matchDesktopForeground(m *DesktopWindowMatch, class, title string) error {
 	}
 	return fmt.Errorf("foreground window (class %q) does not match expect_foreground; input not sent, observe again", class)
 }
+
+var errDesktopNoForeground = errors.New("no usable foreground desktop; restore the RDP display or use the local console")
+
+// Polls until focus and geometry hold still for settle, or limit passes. This is
+// a bounded settling period, not proof that an asynchronous app task completed.
+// Activating a window (taskbar restore, a dialog opening) briefly leaves no
+// foreground window; that counts as motion, not failure, so a gesture that was
+// sent does not come back as an error with no frame.
+func waitDesktopSettled(state func() (desktopGuard, error), poll, settle, limit time.Duration) error {
+	last, err := state()
+	if err != nil && !errors.Is(err, errDesktopNoForeground) {
+		return err
+	}
+	quiet := time.Now()
+	deadline := quiet.Add(limit)
+	for time.Now().Before(deadline) {
+		time.Sleep(poll)
+		live, err := state()
+		if err != nil && !errors.Is(err, errDesktopNoForeground) {
+			return err
+		}
+		if err != nil || last.Foreground != live.Foreground || last.Bounds != live.Bounds {
+			quiet = time.Now()
+			last = live
+		}
+		if err == nil && time.Since(quiet) >= settle {
+			return nil
+		}
+	}
+	return nil // still permit inspection; snapshot decides whether input is safe
+}
 func desktopFailure(id, status string, err error) map[string]any {
 	return map[string]any{"id": id, "ok": false, "input_status": status, "error": err.Error()}
 }

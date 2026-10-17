@@ -78,7 +78,7 @@ func desktopState(session desktopSession) (desktopGuard, error) {
 	g.InputTick = input.Tick
 	g.Foreground = uint64(desktopUser("GetForegroundWindow"))
 	if g.Foreground == 0 {
-		return g, errors.New("no usable foreground desktop; restore the RDP display or use the local console")
+		return g, errDesktopNoForeground
 	}
 	return g, nil
 }
@@ -362,28 +362,7 @@ func performDesktopOperation(req desktopWorkerRequest) desktopWorkerResponse {
 	return out
 }
 
-// Give normal UI composition time to catch up after a gesture. This is a
-// bounded settling period, not proof that an asynchronous app task completed.
+// Give normal UI composition time to catch up after a gesture.
 func waitDesktopQuiet(session desktopSession) error {
-	last, err := desktopState(session)
-	if err != nil {
-		return err
-	}
-	quiet := time.Now()
-	deadline := quiet.Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-		live, err := desktopState(session)
-		if err != nil {
-			return err
-		}
-		if last.Foreground != live.Foreground || last.Bounds != live.Bounds {
-			quiet = time.Now()
-			last = live
-		}
-		if time.Since(quiet) >= 800*time.Millisecond {
-			return nil
-		}
-	}
-	return nil // still permit inspection; snapshot decides whether input is safe
+	return waitDesktopSettled(func() (desktopGuard, error) { return desktopState(session) }, 50*time.Millisecond, 800*time.Millisecond, 3*time.Second)
 }
