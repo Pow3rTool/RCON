@@ -362,6 +362,33 @@ visual preview, and checks that showing it did not change focus. This command
 exists only in the test binary, not the shipped RCON executable.
 
 
+### Waiting and launching as the user
+
+`wait` (MCP `desktop_wait`, or a `desktop_task` step) polls cheap window state
+every 100 ms in the session's worker, never taking screenshots, until a condition
+holds or its timeout (100 ms to 15 s) passes, then returns a fresh observation
+with `condition_met` and `waited_ms`. Conditions: `window` / `window_gone` (a
+visible, uncloaked top-level window matching `{class, title}`), `foreground`,
+`foreground_changed` (relative to when the wait began) and `cursor_idle` (no
+wait or app-starting cursor). It sends no input, so a pause does not block it.
+In a task, a wait that is not met stops the steps after it.
+
+`launch` (MCP `desktop_launch`) runs Windows PowerShell 5.1 as the session's
+logged-on user: `WTSQueryUserToken` (the same filtered, non-elevated token
+Explorer runs with), that user's environment block and profile directory, and
+`winsta0\default`, through `CreateProcessAsUser` from the LocalSystem service.
+It is never SYSTEM and cannot elevate. The command reaches the fixed wrapper in an
+environment variable that the wrapper removes before running it, so it is neither
+on the visible command line nor inherited by programs it starts.
+Without `wait` it returns once PowerShell starts, and GUI programs stay on the
+user's desktop; the purple indicator shows, so the desktop must be observable.
+With `wait` (1 to 45 s, under the broker's receipt deadline) it inherits only its
+standard handles (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), captures up to 1 MiB each
+of stdout and stderr, and runs in a kill-on-close Job Object that ends the whole
+tree at the timeout. A pause blocks launches. The node audit records the command's
+size and a hash prefix, not its text; XConnect's call log keeps the command, as it
+does for `remote_run`.
+
 ## Interactive desktop input (held-v1)
 
 Upgraded Windows nodes advertise `interaction_protocol: held-v1`. XConnect's

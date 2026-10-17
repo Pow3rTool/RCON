@@ -177,3 +177,92 @@ func TestDesktopAttachConsoleProtocol(t *testing.T) {
 		}
 	}
 }
+func TestDesktopWaitProtocolAndConditions(t *testing.T) {
+	id := strings.Repeat("a", 32)
+	run := &DesktopWindowMatch{Class: "#32770", Title: "Run"}
+	wait := func(a DesktopAction) desktopCommand {
+		a.Action = "wait"
+		return desktopCommand{ID: id, Op: "wait", DesktopAction: a}
+	}
+	for _, a := range []DesktopAction{{Until: "foreground", Window: run, DurationMS: 5000}, {Until: "cursor_idle", DurationMS: 100}, {Until: "window_gone", Window: &DesktopWindowMatch{Title: "Saving"}, DurationMS: 15000}} {
+		if err := validateDesktopCommand(wait(a)); err != nil {
+			t.Fatal(a, err)
+		}
+	}
+	for name, a := range map[string]DesktopAction{
+		"no condition":           {DurationMS: 1000},
+		"unknown condition":      {Until: "pixels", DurationMS: 1000},
+		"window needs match":     {Until: "window", DurationMS: 1000},
+		"cursor takes no window": {Until: "cursor_idle", Window: run, DurationMS: 1000},
+		"empty match":            {Until: "window", Window: &DesktopWindowMatch{}, DurationMS: 1000},
+		"timeout too long":       {Until: "cursor_idle", DurationMS: 15001},
+		"timeout missing":        {Until: "cursor_idle"},
+		"no input in a wait":     {Until: "cursor_idle", DurationMS: 1000, Text: "x"},
+	} {
+		if validateDesktopCommand(wait(a)) == nil {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+	x, y := 1, 1
+	if validateDesktopCommand(desktopCommand{ID: id, Op: "act", SessionID: 2, FrameID: id, DesktopAction: DesktopAction{Action: "wait", Until: "cursor_idle", DurationMS: 100}}) == nil {
+		t.Fatal("act accepted a wait")
+	}
+	if validateDesktopCommand(desktopCommand{ID: id, Op: "act", SessionID: 2, FrameID: id, DesktopAction: DesktopAction{Action: "click", X: &x, Y: &y, Until: "cursor_idle"}}) == nil {
+		t.Fatal("click accepted wait fields")
+	}
+
+	dialog := desktopWindowInfo{0x20, "#32770", "Run"}
+	tern := desktopWindowInfo{0x10, "StencilWindow", "Default"}
+	all := []desktopWindowInfo{tern, dialog}
+	for name, tc := range map[string]struct {
+		a    DesktopAction
+		fg   desktopWindowInfo
+		wins []desktopWindowInfo
+		busy bool
+		want bool
+	}{
+		"window present":            {DesktopAction{Until: "window", Window: run}, tern, all, false, true},
+		"window absent":             {DesktopAction{Until: "window", Window: run}, tern, []desktopWindowInfo{tern}, false, false},
+		"window gone":               {DesktopAction{Until: "window_gone", Window: run}, tern, []desktopWindowInfo{tern}, false, true},
+		"foreground matches":        {DesktopAction{Until: "foreground", Window: run}, dialog, all, false, true},
+		"foreground other":          {DesktopAction{Until: "foreground", Window: run}, tern, all, false, false},
+		"foreground none":           {DesktopAction{Until: "foreground_changed"}, desktopWindowInfo{}, all, false, false},
+		"foreground moved":          {DesktopAction{Until: "foreground_changed"}, dialog, all, false, true},
+		"foreground still the same": {DesktopAction{Until: "foreground_changed"}, tern, all, false, false},
+		"cursor busy":               {DesktopAction{Until: "cursor_idle"}, tern, all, true, false},
+		"cursor idle":               {DesktopAction{Until: "cursor_idle"}, tern, all, false, true},
+	} {
+		if got := desktopWaitMet(tc.a, tc.fg, tc.wins, tern.HWND, tc.busy); got != tc.want {
+			t.Errorf("%s: got %v", name, got)
+		}
+	}
+}
+func TestDesktopLaunchProtocol(t *testing.T) {
+	id := strings.Repeat("a", 32)
+	ok := []DesktopLaunch{{Command: "notepad"}, {Command: "omp models vllm", Wait: true, TimeoutMS: 20000}}
+	for _, l := range ok {
+		l := l
+		if err := validateDesktopCommand(desktopCommand{ID: id, Op: "launch", Launch: &l}); err != nil {
+			t.Fatal(l, err)
+		}
+	}
+	for name, l := range map[string]DesktopLaunch{
+		"empty":                 {},
+		"too long":              {Command: strings.Repeat("x", 8001)},
+		"nul":                   {Command: "a\x00b"},
+		"wait needs timeout":    {Command: "x", Wait: true},
+		"timeout beyond broker": {Command: "x", Wait: true, TimeoutMS: desktopLaunchMaxTimeoutMS + 1},
+		"timeout without wait":  {Command: "x", TimeoutMS: 1000},
+	} {
+		l := l
+		if validateDesktopCommand(desktopCommand{ID: id, Op: "launch", Launch: &l}) == nil {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+	if validateDesktopCommand(desktopCommand{ID: id, Op: "observe", Launch: &ok[0]}) == nil {
+		t.Fatal("launch fields accepted outside launch")
+	}
+	if validateDesktopCommand(desktopCommand{ID: id, Op: "launch"}) == nil {
+		t.Fatal("launch without launch fields accepted")
+	}
+}

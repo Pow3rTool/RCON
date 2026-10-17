@@ -31,7 +31,24 @@ type DesktopAction struct {
 	Text       string `json:"text,omitempty"`
 	// Optional intent guard, checked against the live foreground just before input.
 	ExpectForeground *DesktopWindowMatch `json:"expect_foreground,omitempty"`
+	// wait only: the condition, and the window it refers to. DurationMS is the timeout.
+	Until  string              `json:"until,omitempty"`
+	Window *DesktopWindowMatch `json:"window,omitempty"`
 }
+
+// The conditions a wait can poll for without taking screenshots.
+var desktopWaitConditions = map[string]bool{"window": true, "window_gone": true, "foreground": true, "foreground_changed": true, "cursor_idle": true}
+
+// Runs Windows PowerShell 5.1 as the session's logged-on user. Wait captures
+// output, bounded so the broker's receipt deadline is never at risk.
+type DesktopLaunch struct {
+	Command   string `json:"command"`
+	Directory string `json:"directory,omitempty"`
+	Wait      bool   `json:"wait,omitempty"`
+	TimeoutMS int    `json:"timeout_ms,omitempty"`
+}
+
+const desktopLaunchMaxTimeoutMS = 45000
 
 // The frame guard only proves the foreground did not change since the frame.
 // This names the window the caller means to reach (for example the Run dialog
@@ -50,7 +67,8 @@ type desktopCommand struct {
 	DesktopAction
 	Interaction *DesktopInteraction `json:"interaction,omitempty"`
 	// attach_console only: allow disconnecting a connected client or console user.
-	Force bool `json:"force,omitempty"`
+	Force  bool           `json:"force,omitempty"`
+	Launch *DesktopLaunch `json:"launch,omitempty"`
 }
 
 // Every logged-on session, including ones no tool can drive right now, so a
@@ -97,7 +115,20 @@ func validateDesktopCommand(c desktopCommand) error {
 	if c.Force && c.Op != "attach_console" {
 		return errors.New("force only applies to attach_console")
 	}
+	if (c.Launch != nil) != (c.Op == "launch") {
+		return errors.New("launch requires its launch fields and nothing else does")
+	}
 	switch c.Op {
+	case "wait":
+		if c.FrameID != "" || c.Action != "wait" {
+			return errors.New("wait takes a wait action and no frame")
+		}
+		return validateDesktopAction(c.DesktopAction)
+	case "launch":
+		if c.FrameID != "" || c.DesktopAction != (DesktopAction{}) {
+			return errors.New("launch takes no frame or input")
+		}
+		return validateDesktopLaunch(*c.Launch)
 	case "attach_console":
 		if c.SessionID == 0 || c.FrameID != "" || c.DesktopAction != (DesktopAction{}) {
 			return errors.New("attach_console requires session_id and no frame or input")
@@ -125,6 +156,9 @@ func validateDesktopCommand(c desktopCommand) error {
 		}
 		if c.Target != "" {
 			return errors.New("node input requires explicit coordinates")
+		}
+		if c.Action == "wait" {
+			return errors.New("wait is its own operation, not an act")
 		}
 		return validateDesktopAction(c.DesktopAction)
 	default:
@@ -159,16 +193,62 @@ func validateDesktopGuard(c desktopCommand, old, live desktopGuard) error {
 	return nil
 }
 
+func desktopWindowMatches(m *DesktopWindowMatch, class, title string) bool {
+	return (m.Class == "" || strings.EqualFold(m.Class, class)) && (m.Title == "" || strings.Contains(strings.ToLower(title), strings.ToLower(m.Title)))
+}
+
 // The error names the class but not the title: titles are application content
 // and stay out of the node's desktop log.
 func matchDesktopForeground(m *DesktopWindowMatch, class, title string) error {
-	if m == nil {
-		return nil
-	}
-	if (m.Class == "" || strings.EqualFold(m.Class, class)) && (m.Title == "" || strings.Contains(strings.ToLower(title), strings.ToLower(m.Title))) {
+	if m == nil || desktopWindowMatches(m, class, title) {
 		return nil
 	}
 	return fmt.Errorf("foreground window (class %q) does not match expect_foreground; input not sent, observe again", class)
+}
+
+type desktopWindowInfo struct {
+	HWND         uint64
+	Class, Title string
+}
+
+// One poll of a wait: windows are the visible, uncloaked top-level windows;
+// start is the foreground when the wait began.
+func desktopWaitMet(a DesktopAction, foreground desktopWindowInfo, windows []desktopWindowInfo, start uint64, cursorBusy bool) bool {
+	present := false
+	for _, w := range windows {
+		if a.Window != nil && desktopWindowMatches(a.Window, w.Class, w.Title) {
+			present = true
+		}
+	}
+	switch a.Until {
+	case "window":
+		return present
+	case "window_gone":
+		return !present
+	case "foreground":
+		return foreground.HWND != 0 && desktopWindowMatches(a.Window, foreground.Class, foreground.Title)
+	case "foreground_changed":
+		return foreground.HWND != 0 && foreground.HWND != start
+	case "cursor_idle":
+		return !cursorBusy
+	}
+	return false
+}
+
+func validateDesktopLaunch(l DesktopLaunch) error {
+	if l.Command == "" || len(l.Command) > 8000 || strings.ContainsRune(l.Command, 0) {
+		return errors.New("launch command must be 1..8000 bytes")
+	}
+	if len(l.Directory) > 1024 || strings.ContainsRune(l.Directory, 0) {
+		return errors.New("launch directory too long")
+	}
+	if l.Wait && (l.TimeoutMS < 1000 || l.TimeoutMS > desktopLaunchMaxTimeoutMS) {
+		return fmt.Errorf("launch with wait needs timeout_ms 1000..%d; use remote_jobs for longer work", desktopLaunchMaxTimeoutMS)
+	}
+	if !l.Wait && l.TimeoutMS != 0 {
+		return errors.New("timeout_ms applies only with wait")
+	}
+	return nil
 }
 
 var errDesktopNoForeground = errors.New("no usable foreground desktop; restore the RDP display or use the local console")
@@ -326,8 +406,11 @@ func validateDesktopAction(a DesktopAction) error {
 	} else if a.Target != "" || a.X != nil || a.Y != nil || a.Button != "" {
 		return errors.New("key/type cannot include a pointer target")
 	}
-	if a.Action != "drag" && (a.ToX != nil || a.ToY != nil || a.DurationMS != 0) {
+	if a.Action != "drag" && (a.ToX != nil || a.ToY != nil || (a.DurationMS != 0 && a.Action != "wait")) {
 		return errors.New("drag fields require drag")
+	}
+	if a.Action != "wait" && (a.Until != "" || a.Window != nil) {
+		return errors.New("until/window require a wait")
 	}
 	if a.Action != "scroll" && (a.Axis != "" || a.Steps != 0) {
 		return errors.New("scroll fields require scroll")
@@ -357,6 +440,20 @@ func validateDesktopAction(a DesktopAction) error {
 	case "type":
 		if a.Text == "" || len(a.Text) > 1000 || a.Key != "" {
 			return errors.New("type requires 1..1000 bytes of text")
+		}
+	case "wait":
+		if !desktopWaitConditions[a.Until] {
+			return errors.New("wait until must be window, window_gone, foreground, foreground_changed or cursor_idle")
+		}
+		needsWindow := a.Until == "window" || a.Until == "window_gone" || a.Until == "foreground"
+		if needsWindow != (a.Window != nil) {
+			return errors.New("window, window_gone and foreground need window {class,title}; the others take none")
+		}
+		if m := a.Window; m != nil && ((m.Class == "" && m.Title == "") || len(m.Class) > 256 || len(m.Title) > 512) {
+			return errors.New("wait window needs a class and/or title (class <= 256, title <= 512 bytes)")
+		}
+		if a.DurationMS < 100 || a.DurationMS > 15000 || a.Key != "" || a.Text != "" || a.ExpectForeground != nil {
+			return errors.New("wait takes duration_ms 100..15000 as its timeout and no keys, text or expect_foreground")
 		}
 	default:
 		return errors.New("unsupported desktop action")

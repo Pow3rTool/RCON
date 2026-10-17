@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -197,6 +198,27 @@ func nativeDesktop(c desktopCommand) (result map[string]any) {
 	if err := ensureDesktopSafety(session); err != nil {
 		return fail(err)
 	}
+	if c.Op == "launch" {
+		// A started program appears on the user's desktop, so the indicator shows;
+		// a waited command is headless, like remote_run.
+		if !c.Launch.Wait {
+			if err := setDesktopIndicator(session, "AI controlling"); err != nil {
+				return fail(fmt.Errorf("desktop indicator: %w", err))
+			}
+			defer func() { _ = setDesktopIndicator(session, "AI idle") }()
+		}
+		sum := sha256.Sum256([]byte(c.Launch.Command))
+		started := time.Now()
+		detail := fmt.Sprintf("session=%d wait=%v command_bytes=%d command_sha256=%x", session.ID, c.Launch.Wait, len(c.Launch.Command), sum[:8])
+		out, err := launchDesktopUser(session, *c.Launch)
+		if err != nil {
+			auditRecord("desktop_launch", detail, 1, time.Since(started).Seconds(), c.ID)
+			return fail(err)
+		}
+		auditRecord("desktop_launch", fmt.Sprintf("%s exit=%v timed_out=%v", detail, out["exit_code"], out["timed_out"]), 0, time.Since(started).Seconds(), c.ID)
+		out["id"] = c.ID
+		return out
+	}
 	previous := desktopManager.frames[session.ID]
 	if c.Op == "act" {
 		if previous.FrameID != c.FrameID || previous.LogonID != session.LogonID {
@@ -217,7 +239,7 @@ func nativeDesktop(c desktopCommand) (result map[string]any) {
 	// taking a session from a live RDP client passes through the secure desktop
 	// (measured: about a second). An observation waits that out; input never retries.
 	transient, tries := func(err error) bool {
-		return err != nil && c.Op == "observe" && (strings.Contains(err.Error(), errDesktopNoForeground.Error()) ||
+		return err != nil && (c.Op == "observe" || c.Op == "wait") && (strings.Contains(err.Error(), errDesktopNoForeground.Error()) ||
 			(attached != nil && strings.Contains(err.Error(), "locked or secure desktop")))
 	}, 8
 	if attached != nil {

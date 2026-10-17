@@ -275,7 +275,7 @@ func desktopSnapshotMode(session desktopSession, interaction bool) (desktopWorke
 	after.FrameID = desktopID()
 	after.Created = time.Now().UTC()
 	hash := sha256.Sum256(data)
-	obs := map[string]any{"frame_id": after.FrameID, "actionable": actionable, "captured_at": after.Created, "session_id": session.ID, "session_user": session.User, "session_station": session.Station, "image_width": after.Width, "image_height": after.Height, "sha256": hex.EncodeToString(hash[:]), "last_input_tick": after.InputTick, "desktop_rect": map[string]int{"x": after.Bounds.X, "y": after.Bounds.Y, "width": after.Bounds.Width, "height": after.Bounds.Height}, "windows": windowsList, "cursor": cursor, "pressed_virtual_keys": desktopPressed(), "foreground": desktopWindow(uintptr(after.Foreground), after), "capabilities": map[string]any{"worker_version": "rcon-native-1", "transport": "native", "key_grammar": "chord-v1", "actions": []string{"click", "double_click", "move", "scroll", "drag", "key", "type"}, "buttons": []string{"left", "right", "middle"}, "wheel_axes": []string{"vertical", "horizontal"}, "cross_call_held_input": true, "interaction_protocol": "held-v1", "interruption_policy": "external-escape-triple", "pause_escape_count": 3, "pause_escape_window_ms": 1500, "pause_scope": "logged-on-session-including-idle", "resume_policy": "local-badge-click", "input_timestamp_policy": "diagnostic-only", "interaction_max_lease_ms": 60000, "interaction_max_frames": 6, "window_geometry": true, "cursor_metadata": true, "session_selection": true, "visual_indicator": true, "visual_pointer": "tagged-v1", "foreground_expectation": true, "key_scan_codes": true, "console_attach": true, "desktop_state": true}}
+	obs := map[string]any{"frame_id": after.FrameID, "actionable": actionable, "captured_at": after.Created, "session_id": session.ID, "session_user": session.User, "session_station": session.Station, "image_width": after.Width, "image_height": after.Height, "sha256": hex.EncodeToString(hash[:]), "last_input_tick": after.InputTick, "desktop_rect": map[string]int{"x": after.Bounds.X, "y": after.Bounds.Y, "width": after.Bounds.Width, "height": after.Bounds.Height}, "windows": windowsList, "cursor": cursor, "pressed_virtual_keys": desktopPressed(), "foreground": desktopWindow(uintptr(after.Foreground), after), "capabilities": map[string]any{"worker_version": "rcon-native-1", "transport": "native", "key_grammar": "chord-v1", "actions": []string{"click", "double_click", "move", "scroll", "drag", "key", "type"}, "buttons": []string{"left", "right", "middle"}, "wheel_axes": []string{"vertical", "horizontal"}, "cross_call_held_input": true, "interaction_protocol": "held-v1", "interruption_policy": "external-escape-triple", "pause_escape_count": 3, "pause_escape_window_ms": 1500, "pause_scope": "logged-on-session-including-idle", "resume_policy": "local-badge-click", "input_timestamp_policy": "diagnostic-only", "interaction_max_lease_ms": 60000, "interaction_max_frames": 6, "window_geometry": true, "cursor_metadata": true, "session_selection": true, "visual_indicator": true, "visual_pointer": "tagged-v1", "foreground_expectation": true, "key_scan_codes": true, "console_attach": true, "desktop_state": true, "wait_conditions": []string{"window", "window_gone", "foreground", "foreground_changed", "cursor_idle"}, "user_launch": true}}
 	result.Result = map[string]any{"ok": true, "observation": obs, "image": map[string]any{"mimeType": "image/jpeg", "data": base64.StdEncoding.EncodeToString(data)}}
 	pause, pauseErr := readDesktopPause()
 	obs["control_paused"] = pause != nil || pauseErr != nil
@@ -350,6 +350,14 @@ func performDesktopOperation(req desktopWorkerRequest) desktopWorkerResponse {
 			return fail(err)
 		}
 	}
+	var waited map[string]any
+	if c.Op == "wait" {
+		met, ms := waitDesktopCondition(c.DesktopAction)
+		waited = map[string]any{"condition_met": met, "waited_ms": ms, "until": c.Until}
+		if met { // let the window that satisfied it finish drawing
+			_ = waitDesktopSettled(func() (desktopGuard, error) { return desktopState(req.Session) }, 50*time.Millisecond, 300*time.Millisecond, 1500*time.Millisecond)
+		}
+	}
 	if c.WaitMS > 0 {
 		time.Sleep(time.Duration(c.WaitMS) * time.Millisecond)
 	}
@@ -359,7 +367,61 @@ func performDesktopOperation(req desktopWorkerRequest) desktopWorkerResponse {
 	}
 	out.Result["id"] = c.ID
 	out.Result["input_status"] = status
+	for k, v := range waited {
+		out.Result[k] = v
+	}
 	return out
+}
+
+// Polls cheap Win32 state, never screenshots, until the condition holds or the
+// timeout passes. While the input desktop is locked or secure nothing on the
+// user's desktop can be judged, so polling just continues.
+func waitDesktopCondition(a DesktopAction) (bool, int64) {
+	start := time.Now()
+	startForeground := uint64(desktopUser("GetForegroundWindow"))
+	deadline := start.Add(time.Duration(a.DurationMS) * time.Millisecond)
+	for {
+		if desktopDefault() == nil {
+			fg := desktopUser("GetForegroundWindow")
+			title, class, _ := desktopWindowIdentity(fg)
+			if desktopWaitMet(a, desktopWindowInfo{uint64(fg), class, title}, desktopTopWindows(), startForeground, desktopCursorBusy()) {
+				return true, time.Since(start).Milliseconds()
+			}
+		}
+		if time.Now().After(deadline) {
+			return false, time.Since(start).Milliseconds()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// Visible, uncloaked top-level windows (titled or not), identity only.
+func desktopTopWindows() []desktopWindowInfo {
+	result := []desktopWindowInfo{}
+	h := desktopUser("GetTopWindow", 0)
+	for n := 0; h != 0 && n < 1000; n++ {
+		if desktopUser("IsWindowVisible", h) != 0 && !desktopCloaked(h) {
+			if title, class, _ := desktopWindowIdentity(h); class != desktopIndicatorClass {
+				result = append(result, desktopWindowInfo{uint64(h), class, title})
+			}
+		}
+		h = desktopUser("GetWindow", h, 2)
+	}
+	return result
+}
+
+// The wait (hourglass) or app-starting cursor means the user would see "busy".
+func desktopCursorBusy() bool {
+	info := struct {
+		Size, Flags uint32
+		Handle      uintptr
+		X, Y        int32
+	}{}
+	info.Size = uint32(unsafe.Sizeof(info))
+	if desktopUser("GetCursorInfo", uintptr(unsafe.Pointer(&info))) == 0 {
+		return false
+	}
+	return info.Handle == desktopUser("LoadCursorW", 0, 32514) || info.Handle == desktopUser("LoadCursorW", 0, 32650) // IDC_WAIT, IDC_APPSTARTING
 }
 
 // Give normal UI composition time to catch up after a gesture.
