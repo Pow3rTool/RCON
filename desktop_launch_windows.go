@@ -16,10 +16,12 @@ import (
 )
 
 // Same contract as remote_run's wrapper: UTF-8 output, and $LASTEXITCODE or a
-// failed last statement folded into the exit code. The operator command arrives
+// failed last statement folded into the exit code. Progress is silenced first:
+// a user's first module load otherwise writes CLIXML progress records to stderr. The operator command arrives
 // in an environment variable, never on the visible command line, and is removed
 // from the environment before it runs so programs it starts do not inherit it.
 const desktopLaunchWrapper = `
+$ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
 $command = $env:__RCON_LAUNCH
